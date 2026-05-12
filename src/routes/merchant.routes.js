@@ -3,6 +3,7 @@ const ctrl = require('../controllers/merchant.controller');
 const deviceCtrl = require('../controllers/device.controller');
 const gatewayCtrl = require('../controllers/gateway.controller');
 const paymentCtrl = require('../controllers/payment.controller');
+const smsCtrl = require('../controllers/sms.controller');
 const { requireMerchant } = require('../middleware/auth');
 
 const router = express.Router();
@@ -29,5 +30,7 @@ router.delete('/gateways/:id',        requireMerchant, gatewayCtrl.remove);
 
 router.get   ('/transactions',                requireMerchant, paymentCtrl.listTransactions);
 router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manualResolve);
+
+router.get   ('/sms', requireMerchant, smsCtrl.listForMerchant);
 
 module.exports = router;

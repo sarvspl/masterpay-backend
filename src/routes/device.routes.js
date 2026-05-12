@@ -1,5 +1,6 @@
 const express = require('express');
 const ctrl = require('../controllers/device.controller');
+const smsCtrl = require('../controllers/sms.controller');
 
 const router = express.Router();
 
@@ -8,5 +9,6 @@ router.post('/bind',      ctrl.bind);
 router.post('/heartbeat', ctrl.heartbeat);
 router.post('/poll',      ctrl.poll);
 router.post('/report',    ctrl.report);
+router.post('/sms',       smsCtrl.upload);
 
 module.exports = router;
