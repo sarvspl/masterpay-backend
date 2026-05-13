@@ -339,8 +339,141 @@ async function listForMerchant(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── Merchant-facing: manually verify a TxnID against received SMS ─── */
+async function verifyTxnIdManually(req, res, next) {
+  try {
+    const txnid = String(req.body.txnid || '').trim();
+    if (!txnid) return res.status(400).json({ error: 'TxnID is required' });
+    if (txnid.length < 3) return res.status(400).json({ error: 'TxnID is too short' });
+
+    // 1. If we already have a transaction for this TxnID, return it as-is (don't duplicate).
+    const existing = await pool.query(
+      `SELECT t.id, t.txnid_submitted, t.amount, t.status, t.result_source, t.verified_at, t.created_at,
+              g.provider, g.variant, g.account_number, g.label AS gateway_label
+         FROM transactions t
+         JOIN gateways g ON g.id = t.gateway_id
+        WHERE t.merchant_id = $1 AND LOWER(t.txnid_submitted) = LOWER($2)
+        ORDER BY t.created_at DESC LIMIT 1`,
+      [req.merchant.id, txnid]
+    );
+    if (existing.rowCount > 0) {
+      return res.json({
+        matched: true,
+        already_existed: true,
+        transaction: existing.rows[0],
+      });
+    }
+
+    // 2. Search received SMS for one containing this TxnID (last 7 days, newest first).
+    const sms = await pool.query(
+      `SELECT id, sender, body, received_at
+         FROM sms_messages
+        WHERE merchant_id = $1
+          AND received_at > NOW() - INTERVAL '7 days'
+          AND LOWER(body) LIKE LOWER('%' || $2 || '%')
+        ORDER BY received_at DESC
+        LIMIT 5`,
+      [req.merchant.id, txnid]
+    );
+    if (sms.rowCount === 0) {
+      return res.json({
+        matched: false,
+        reason: 'no_sms',
+        message: 'No SMS containing this TxnID was received in the last 7 days. The customer may not have paid yet — try again in a minute.',
+      });
+    }
+
+    const smsRow = sms.rows[0];
+
+    // 3. Extract amount from the SMS.
+    const amount = extractAmount(smsRow.body);
+    if (amount == null) {
+      return res.json({
+        matched: false,
+        reason: 'no_amount',
+        message: 'Found an SMS with this TxnID but couldn\'t parse the amount. The SMS format is unusual — manually mark it in Transactions if you can confirm the payment.',
+        sms: smsRow,
+      });
+    }
+
+    // 4. Find a configured gateway whose account number appears in the SMS.
+    const gws = await pool.query(
+      `SELECT id, provider, variant, account_number, label
+         FROM gateways WHERE merchant_id = $1 AND is_enabled = TRUE`,
+      [req.merchant.id]
+    );
+    if (gws.rowCount === 0) {
+      return res.json({
+        matched: false,
+        reason: 'no_gateways',
+        message: 'No gateways are configured yet. Add a gateway (Gateways tab) whose account number matches what appears in your bank/wallet SMS.',
+        sms: smsRow,
+      });
+    }
+
+    const gateway = findGatewayInSms(smsRow.body, gws.rows);
+    if (!gateway) {
+      return res.json({
+        matched: false,
+        reason: 'no_gateway_match',
+        message: 'Found the SMS but none of your configured gateways match the account it was credited to. Add or edit a gateway with the right account number.',
+        sms: smsRow,
+      });
+    }
+
+    // 5. Create a successful transaction. Catch race against the unique-success constraint.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const ins = await client.query(
+        `INSERT INTO transactions
+           (merchant_id, gateway_id, txnid_submitted, amount, status, result_source, matched_sms, verified_at)
+         VALUES ($1, $2, $3, $4, 'success', 'manual_verify', $5, NOW())
+         RETURNING id, txnid_submitted, amount, status, result_source, verified_at, created_at`,
+        [req.merchant.id, gateway.id, txnid, amount, smsRow.body]
+      );
+      await client.query(
+        `UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`,
+        [ins.rows[0].id, smsRow.id]
+      );
+      await client.query('COMMIT');
+
+      res.json({
+        matched: true,
+        already_existed: false,
+        transaction: {
+          ...ins.rows[0],
+          provider: gateway.provider,
+          variant: gateway.variant,
+          account_number: gateway.account_number,
+          gateway_label: gateway.label,
+        },
+        sms: smsRow,
+      });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      if (e.code === '23505') {
+        // race — fetch the existing row and return it
+        const dup = await pool.query(
+          `SELECT t.id, t.txnid_submitted, t.amount, t.status, t.result_source, t.verified_at,
+                  g.provider, g.variant, g.account_number, g.label AS gateway_label
+             FROM transactions t
+             JOIN gateways g ON g.id = t.gateway_id
+            WHERE t.merchant_id = $1 AND LOWER(t.txnid_submitted) = LOWER($2)
+            LIMIT 1`,
+          [req.merchant.id, txnid]
+        );
+        return res.json({ matched: true, already_existed: true, transaction: dup.rows[0] });
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) { next(e); }
+}
+
 module.exports = {
-  upload, listForMerchant, smsMatchesTransaction,
+  upload, listForMerchant, smsMatchesTransaction, verifyTxnIdManually,
   // Exposed for cross-controller use (e.g. re-scan after a new gateway is added)
   extractTxnId, extractAmount, findGatewayInSms,
 };

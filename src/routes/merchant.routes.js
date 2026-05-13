@@ -31,6 +31,7 @@ router.delete('/gateways/:id',        requireMerchant, gatewayCtrl.remove);
 router.get   ('/transactions',                requireMerchant, paymentCtrl.listTransactions);
 router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manualResolve);
 
-router.get   ('/sms', requireMerchant, smsCtrl.listForMerchant);
+router.get   ('/sms',        requireMerchant, smsCtrl.listForMerchant);
+router.post  ('/verify',     requireMerchant, smsCtrl.verifyTxnIdManually);
 
 module.exports = router;
