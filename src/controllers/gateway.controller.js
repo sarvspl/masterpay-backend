@@ -1,7 +1,12 @@
 const pool = require('../db/pool');
 
-const PROVIDERS = ['bkash', 'rocket', 'nagad'];
-const VARIANTS = ['personal', 'agent'];
+// Per-provider allowed variants. Add entries here as you support more providers/apps.
+const CATALOG = {
+  bkash:   ['personal', 'agent'],
+  nagad:   ['personal', 'agent'],
+  rocket:  ['personal', 'agent'],
+  upi:     ['gpay', 'phonepe', 'paytm', 'other'],
+};
 const CHARGE_TYPES = ['fixed', 'percent'];
 
 function validateBody(body) {
@@ -9,9 +14,9 @@ function validateBody(body) {
   const variant  = String(body.variant  || '').toLowerCase();
   const account_number = String(body.account_number || '').trim();
 
-  if (!PROVIDERS.includes(provider)) return 'Invalid provider';
-  if (!VARIANTS.includes(variant))   return 'Invalid variant';
-  if (!account_number)               return 'Account number is required';
+  if (!CATALOG[provider])                     return 'Invalid provider';
+  if (!CATALOG[provider].includes(variant))   return `Invalid variant for ${provider}. Allowed: ${CATALOG[provider].join(', ')}`;
+  if (!account_number)                        return 'Account number is required';
 
   if (body.charge_type && !CHARGE_TYPES.includes(body.charge_type))
     return 'Invalid charge_type';
