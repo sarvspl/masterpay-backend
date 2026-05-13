@@ -1,5 +1,5 @@
 const pool = require('../db/pool');
-const { extractTxnId, extractAmount, findGatewayInSms } = require('./sms.controller');
+const { extractTxnId, extractAmount, findGatewayInSms, extractPayer } = require('./sms.controller');
 
 // Per-provider allowed variants. Add entries here as you support more providers/apps.
 const CATALOG = {
@@ -73,13 +73,14 @@ async function rescanUnmatchedSms(merchantId, gateway) {
         await client.query('ROLLBACK');
         continue;
       }
+      const payer = extractPayer(s.body);
       const ins = await client.query(
         `INSERT INTO transactions
            (merchant_id, gateway_id, txnid_submitted, amount, status,
-            result_source, matched_sms, verified_at)
-         VALUES ($1, $2, $3, $4, 'success', 'sms_inbound', $5, NOW())
+            result_source, matched_sms, verified_at, payer_name, payer_phone)
+         VALUES ($1, $2, $3, $4, 'success', 'sms_inbound', $5, NOW(), $6, $7)
          RETURNING id`,
-        [merchantId, gateway.id, txnid, amount, s.body]
+        [merchantId, gateway.id, txnid, amount, s.body, payer.name, payer.phone]
       );
       await client.query(
         `UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`,

@@ -1,0 +1,2 @@
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payer_name  VARCHAR(120);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payer_phone VARCHAR(40);

@@ -39,6 +39,34 @@ function extractAmount(body) {
   return null;
 }
 
+// Extract the payer (sender) info from the SMS body.
+// Returns { name, phone } — either or both may be null.
+function extractPayer(body) {
+  const text = String(body || '');
+
+  // 1. Indian UPI bank format: "UPI/P2A/<ref>/<NAME>/<BANK>/UPI"
+  //    e.g. "UPI/P2A/123063504215/Arnab Mis/JIOP/UPI - Axis Bank"
+  let m = text.match(/UPI\/[A-Z0-9]+\/\d+\/([^\/\n\r]{2,60})\/[A-Z0-9]+\/UPI/i);
+  if (m) return { name: m[1].trim(), phone: null };
+
+  // 2. bKash/Nagad/Rocket: "Tk 500 from 01712345678"
+  m = text.match(/\bfrom\s+(\+?\d[\d\s-]{8,18}\d)\b/i);
+  if (m) {
+    const phone = m[1].replace(/[\s-]/g, '');
+    return { name: null, phone };
+  }
+
+  // 3. "received from <Name>" or "by <Name>" — title-cased name only (avoid false positives)
+  m = text.match(/(?:received\s+from|sent\s+by|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b/);
+  if (m) return { name: m[1].trim(), phone: null };
+
+  // 4. UPI VPA in body: "from xxxx@bank"
+  m = text.match(/\bfrom\s+([\w.\-]+@[\w]+)/i);
+  if (m) return { name: m[1], phone: null };
+
+  return { name: null, phone: null };
+}
+
 // Find a gateway whose account_number (or its last 4-8 digits) appears in the SMS body.
 // Multiple identifiers may be stored on one gateway, comma-separated — e.g.
 //   "8389834331, 6788"  (mobile + bank account suffix)
@@ -139,13 +167,14 @@ async function tryCreateInbound(client, merchantId, smsId, sender, smsBody) {
   if (dup.rowCount > 0) return null;
 
   try {
+    const payer = extractPayer(smsBody);
     const r = await client.query(
       `INSERT INTO transactions
          (merchant_id, gateway_id, txnid_submitted, amount, status,
-          result_source, matched_sms, verified_at)
-       VALUES ($1, $2, $3, $4, 'success', 'sms_inbound', $5, NOW())
+          result_source, matched_sms, verified_at, payer_name, payer_phone)
+       VALUES ($1, $2, $3, $4, 'success', 'sms_inbound', $5, NOW(), $6, $7)
        RETURNING id`,
-      [merchantId, gateway.id, txnid, amount, smsBody]
+      [merchantId, gateway.id, txnid, amount, smsBody, payer.name, payer.phone]
     );
     const txId = r.rows[0].id;
     await client.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [txId, smsId]);
@@ -176,15 +205,18 @@ async function tryAutoMatch(client, merchantId, smsId, smsBody) {
 
   for (const tx of pending.rows) {
     if (smsMatchesTransaction(smsBody, tx)) {
+      const payer = extractPayer(smsBody);
       await client.query(
         `UPDATE transactions
             SET status = 'success',
                 result_source = 'apk',
                 matched_sms = $2,
                 verified_at = NOW(),
-                updated_at = NOW()
+                updated_at = NOW(),
+                payer_name  = COALESCE(payer_name,  $3),
+                payer_phone = COALESCE(payer_phone, $4)
           WHERE id = $1 AND status = 'pending'`,
-        [tx.id, smsBody]
+        [tx.id, smsBody, payer.name, payer.phone]
       );
       await client.query(
         `UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`,
@@ -434,12 +466,13 @@ async function verifyTxnIdManually(req, res, next) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const payer = extractPayer(smsRow.body);
       const ins = await client.query(
         `INSERT INTO transactions
-           (merchant_id, gateway_id, txnid_submitted, amount, status, result_source, matched_sms, verified_at)
-         VALUES ($1, $2, $3, $4, 'success', 'manual_verify', $5, NOW())
-         RETURNING id, txnid_submitted, amount, status, result_source, verified_at, created_at`,
-        [req.merchant.id, gateway.id, txnid, amount, smsRow.body]
+           (merchant_id, gateway_id, txnid_submitted, amount, status, result_source, matched_sms, verified_at, payer_name, payer_phone)
+         VALUES ($1, $2, $3, $4, 'success', 'manual_verify', $5, NOW(), $6, $7)
+         RETURNING id, txnid_submitted, amount, status, result_source, verified_at, created_at, payer_name, payer_phone`,
+        [req.merchant.id, gateway.id, txnid, amount, smsRow.body, payer.name, payer.phone]
       );
       await client.query(
         `UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`,
@@ -484,5 +517,5 @@ async function verifyTxnIdManually(req, res, next) {
 module.exports = {
   upload, listForMerchant, smsMatchesTransaction, verifyTxnIdManually,
   // Exposed for cross-controller use (e.g. re-scan after a new gateway is added)
-  extractTxnId, extractAmount, findGatewayInSms,
+  extractTxnId, extractAmount, findGatewayInSms, extractPayer,
 };
