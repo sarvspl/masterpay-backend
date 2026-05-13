@@ -185,7 +185,14 @@ async function update(req, res, next) {
       ]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });
-    res.json({ gateway: r.rows[0] });
+
+    // If account_number changed, retry unmatched SMS against the updated gateway.
+    let matched = 0;
+    if (account_number) {
+      matched = await rescanUnmatchedSms(req.merchant.id, r.rows[0]);
+    }
+
+    res.json({ gateway: r.rows[0], retroactively_matched: matched });
   } catch (e) { next(e); }
 }
 
