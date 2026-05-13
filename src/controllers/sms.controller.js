@@ -339,4 +339,8 @@ async function listForMerchant(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { upload, listForMerchant, smsMatchesTransaction };
+module.exports = {
+  upload, listForMerchant, smsMatchesTransaction,
+  // Exposed for cross-controller use (e.g. re-scan after a new gateway is added)
+  extractTxnId, extractAmount, findGatewayInSms,
+};

@@ -1,11 +1,11 @@
 const pool = require('../db/pool');
+const { extractTxnId, extractAmount, findGatewayInSms } = require('./sms.controller');
 
 // Per-provider allowed variants. Add entries here as you support more providers/apps.
 const CATALOG = {
   bkash:   ['personal', 'agent'],
   nagad:   ['personal', 'agent'],
   rocket:  ['personal', 'agent'],
-  upi:     ['gpay', 'phonepe', 'paytm', 'other'],
 };
 const CHARGE_TYPES = ['fixed', 'percent'];
 
@@ -30,6 +30,71 @@ function toNum(v) {
   if (v === '' || v == null) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Scan unmatched SMS in the last 7 days for this merchant. For each SMS whose
+ * body references the newly-added gateway's account (and has parseable TxnID +
+ * amount), create an inbound transaction. Safe to call after creating any gateway.
+ *
+ * Returns the count of SMS that produced new transactions.
+ */
+async function rescanUnmatchedSms(merchantId, gateway) {
+  const sms = await pool.query(
+    `SELECT id, body
+       FROM sms_messages
+      WHERE merchant_id = $1
+        AND matched_tx_id IS NULL
+        AND received_at > NOW() - INTERVAL '7 days'
+      ORDER BY received_at DESC`,
+    [merchantId]
+  );
+  if (sms.rows.length === 0) return 0;
+
+  const gws = [gateway]; // only check against THIS gateway (we just created it)
+  let count = 0;
+
+  for (const s of sms.rows) {
+    const hit = findGatewayInSms(s.body, gws);
+    if (!hit) continue;
+    const txnid = extractTxnId(s.body);
+    const amount = extractAmount(s.body);
+    if (!txnid || amount == null) continue;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Skip if this TxnID has already been recorded
+      const dup = await client.query(
+        `SELECT 1 FROM transactions WHERE merchant_id = $1 AND txnid_submitted = $2`,
+        [merchantId, txnid]
+      );
+      if (dup.rowCount > 0) {
+        await client.query('ROLLBACK');
+        continue;
+      }
+      const ins = await client.query(
+        `INSERT INTO transactions
+           (merchant_id, gateway_id, txnid_submitted, amount, status,
+            result_source, matched_sms, verified_at)
+         VALUES ($1, $2, $3, $4, 'success', 'sms_inbound', $5, NOW())
+         RETURNING id`,
+        [merchantId, gateway.id, txnid, amount, s.body]
+      );
+      await client.query(
+        `UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`,
+        [ins.rows[0].id, s.id]
+      );
+      await client.query('COMMIT');
+      count += 1;
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      if (e.code !== '23505') throw e; // ignore dup-on-race
+    } finally {
+      client.release();
+    }
+  }
+  return count;
 }
 
 async function list(req, res, next) {
@@ -73,7 +138,14 @@ async function create(req, res, next) {
         !!req.body.balance_check,
       ]
     );
-    res.status(201).json({ gateway: r.rows[0] });
+    const gateway = r.rows[0];
+
+    // Retroactively scan recent unmatched SMS for this merchant — any that have
+    // a TxnID + amount AND reference this gateway's account get auto-promoted
+    // to inbound transactions. Cap at last 7 days to keep it bounded.
+    const matched = await rescanUnmatchedSms(req.merchant.id, gateway);
+
+    res.status(201).json({ gateway, retroactively_matched: matched });
   } catch (e) {
     if (e.code === '23505') {
       return res.status(409).json({ error: 'A gateway with this account number already exists for this provider/variant.' });
