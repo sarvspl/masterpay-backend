@@ -40,14 +40,23 @@ function extractAmount(body) {
 }
 
 // Find a gateway whose account_number (or its last 4-8 digits) appears in the SMS body.
+// Multiple identifiers may be stored on one gateway, comma-separated — e.g.
+//   "8389834331, 6788"  (mobile + bank account suffix)
+// Any one of them appearing in the SMS body counts as a match.
 function findGatewayInSms(body, gateways) {
   const bodyDigits = body.replace(/\D/g, '');
   for (const g of gateways) {
-    const acctDigits = String(g.account_number).replace(/\D/g, '');
-    if (acctDigits.length < 4) continue;
-    if (bodyDigits.includes(acctDigits)) return g;                 // full match
-    const last4 = acctDigits.slice(-4);
-    if (last4 && bodyDigits.includes(last4)) return g;             // last-4 fallback
+    const identifiers = String(g.account_number || '')
+      .split(/[,;|\n]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const id of identifiers) {
+      const acctDigits = id.replace(/\D/g, '');
+      if (acctDigits.length < 4) continue;
+      if (bodyDigits.includes(acctDigits)) return g;       // full match
+      const last4 = acctDigits.slice(-4);
+      if (last4 && bodyDigits.includes(last4)) return g;   // last-4 fallback
+    }
   }
   return null;
 }
