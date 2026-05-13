@@ -4,6 +4,54 @@ function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/* ─── SMS parsing helpers ─── */
+
+// Extract a TxnID / TrxID / Ref / UTR / UPI ref from the SMS body.
+function extractTxnId(body) {
+  const patterns = [
+    /(?:txn\s*id|trx\s*id|trxid|trans(?:action)?\s*id)[:\s.]+([A-Z0-9]{4,32})/i,
+    /(?:ref(?:erence)?\s*(?:no\.?|id|num)?)[:\s.]+([A-Z0-9]{4,32})/i,
+    /\butr[:\s.]+([A-Z0-9]{4,32})/i,
+    // UPI reference: "UPI/P2A/123019535144/..." or "upi ref 123019535144"
+    /upi\s*(?:ref(?:erence)?[:\s.]+|[\/\-][a-z0-9]+[\/\-])(\d{6,32})/i,
+  ];
+  for (const re of patterns) {
+    const m = body.match(re);
+    if (m && m[1]) return m[1].toUpperCase();
+  }
+  return null;
+}
+
+// Extract an amount from the SMS body. Returns number or null.
+function extractAmount(body) {
+  const patterns = [
+    /(?:inr|rs\.?|₹|tk\.?|৳|usd|\$|eur|€|gbp|£)\s*([0-9][0-9,]*(?:\.\d{1,2})?)/i,
+    /([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:credited|received|debited|deposit(?:ed)?)/i,
+    /(?:credited|received|debited)\s+(?:with\s+)?(?:inr|rs\.?|₹|tk\.?|৳)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)/i,
+  ];
+  for (const re of patterns) {
+    const m = body.match(re);
+    if (m && m[1]) {
+      const n = parseFloat(m[1].replace(/,/g, ''));
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  }
+  return null;
+}
+
+// Find a gateway whose account_number (or its last 4-8 digits) appears in the SMS body.
+function findGatewayInSms(body, gateways) {
+  const bodyDigits = body.replace(/\D/g, '');
+  for (const g of gateways) {
+    const acctDigits = String(g.account_number).replace(/\D/g, '');
+    if (acctDigits.length < 4) continue;
+    if (bodyDigits.includes(acctDigits)) return g;                 // full match
+    const last4 = acctDigits.slice(-4);
+    if (last4 && bodyDigits.includes(last4)) return g;             // last-4 fallback
+  }
+  return null;
+}
+
 /**
  * Match logic for a single SMS against a single pending transaction.
  * Returns true only if ALL applicable fields match.
@@ -50,6 +98,54 @@ function smsMatchesTransaction(smsBody, tx) {
   }
 
   return true;
+}
+
+/**
+ * Try to create a new "inbound" transaction from an SMS that didn't match
+ * any pending session. Useful when payments come in without a checkout flow.
+ *
+ * Returns the new transaction id, or null if we couldn't extract enough data.
+ */
+async function tryCreateInbound(client, merchantId, smsId, sender, smsBody) {
+  // Load this merchant's enabled gateways
+  const gws = await client.query(
+    `SELECT id, provider, variant, account_number FROM gateways
+      WHERE merchant_id = $1 AND is_enabled = TRUE`,
+    [merchantId]
+  );
+  if (gws.rows.length === 0) return null;
+
+  const gateway = findGatewayInSms(smsBody, gws.rows);
+  if (!gateway) return null;
+
+  const txnid = extractTxnId(smsBody);
+  const amount = extractAmount(smsBody);
+  if (!txnid || amount == null) return null;
+
+  // Don't double-record if this TxnID already exists for this merchant
+  const dup = await client.query(
+    `SELECT 1 FROM transactions WHERE merchant_id = $1 AND txnid_submitted = $2`,
+    [merchantId, txnid]
+  );
+  if (dup.rowCount > 0) return null;
+
+  try {
+    const r = await client.query(
+      `INSERT INTO transactions
+         (merchant_id, gateway_id, txnid_submitted, amount, status,
+          result_source, matched_sms, verified_at)
+       VALUES ($1, $2, $3, $4, 'success', 'sms_inbound', $5, NOW())
+       RETURNING id`,
+      [merchantId, gateway.id, txnid, amount, smsBody]
+    );
+    const txId = r.rows[0].id;
+    await client.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [txId, smsId]);
+    return txId;
+  } catch (e) {
+    // 23505 = unique violation; race with another upload — treat as already recorded
+    if (e.code === '23505') return null;
+    throw e;
+  }
 }
 
 /**
@@ -172,9 +268,17 @@ async function upload(req, res, next) {
         const smsId = ins.rows[0].id;
         stored.push(smsId);
 
-        // Try auto-match against pending transactions
-        const txId = await tryAutoMatch(client, merchantId, smsId, body);
-        if (txId) matched.push({ sms_id: smsId, transaction_id: txId });
+        // 1) Try matching against a pending checkout transaction
+        let txId = await tryAutoMatch(client, merchantId, smsId, body);
+
+        // 2) No pending match? Try creating an inbound transaction from the SMS itself
+        let inbound = false;
+        if (!txId) {
+          txId = await tryCreateInbound(client, merchantId, smsId, sender, body);
+          if (txId) inbound = true;
+        }
+
+        if (txId) matched.push({ sms_id: smsId, transaction_id: txId, inbound });
 
         await client.query('COMMIT');
       }

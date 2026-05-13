@@ -235,10 +235,10 @@ async function listTransactions(req, res, next) {
     let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
                       t.result_source, t.verified_at, t.failure_reason, t.created_at,
                       g.provider, g.variant, g.account_number,
-                      s.order_id
+                      s.order_id, s.currency AS session_currency
                  FROM transactions t
                  JOIN gateways g ON g.id = t.gateway_id
-                 JOIN payment_sessions s ON s.id = t.session_id
+                 LEFT JOIN payment_sessions s ON s.id = t.session_id
                 WHERE t.merchant_id = $1`;
     if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
     if (q)      { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
