@@ -22,8 +22,27 @@ async function bind(req, res, next) {
     if (m.rows[0].is_suspended) return res.status(403).json({ error: 'Merchant account is suspended', suspended: true });
     const merchant = m.rows[0];
 
-    // Upsert against the partial unique index (only active rows).
-    // If an old unbound row exists for the same device_id, this INSERT creates a fresh active row alongside it.
+    // First: if an UNBOUND row exists for the same merchant+device_id, resurrect it
+    // (clear unbound_at, refresh metadata). This keeps history clean — re-installing
+    // or restarting the APK doesn't pile up past-device rows.
+    const resurrect = await pool.query(
+      `UPDATE devices
+          SET unbound_at     = NULL,
+              unbound_reason = NULL,
+              model          = COALESCE($3, model),
+              manufacturer   = COALESCE($4, manufacturer),
+              os_version     = COALESCE($5, os_version),
+              device_token   = COALESCE($6, device_token),
+              last_seen_at   = NOW()
+        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NOT NULL
+        RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null]
+    );
+    if (resurrect.rowCount > 0) {
+      return res.json({ ok: true, merchant_name: merchant.name, device: resurrect.rows[0], resurrected: true });
+    }
+
+    // Otherwise upsert against the active-row partial unique index.
     const r = await pool.query(
       `INSERT INTO devices (merchant_id, device_id, model, manufacturer, os_version, device_token, last_seen_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -112,7 +131,7 @@ async function listForMerchant(req, res, next) {
     const { rows } = await pool.query(
       `SELECT id, device_id, model, manufacturer, os_version, is_enabled,
               last_seen_at, created_at,
-              (last_seen_at IS NOT NULL AND last_seen_at > NOW() - INTERVAL '5 minutes') AS is_online
+              (last_seen_at IS NOT NULL AND last_seen_at > NOW() - INTERVAL '10 minutes') AS is_online
          FROM devices
         WHERE merchant_id = $1 AND unbound_at IS NULL
         ORDER BY created_at DESC`,
