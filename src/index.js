@@ -7,6 +7,7 @@ const adminRoutes = require('./routes/admin.routes');
 const deviceRoutes = require('./routes/device.routes');
 const paymentRoutes = require('./routes/payment.routes');
 const checkoutRoutes = require('./routes/checkout.routes');
+const providerRoutes = require('./routes/provider.routes');
 const { notFound, errorHandler } = require('./middleware/error');
 
 const app = express();
@@ -21,6 +22,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/device', deviceRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/checkout', checkoutRoutes);
+app.use('/api/providers', providerRoutes);
 
 app.use(notFound);
 app.use(errorHandler);

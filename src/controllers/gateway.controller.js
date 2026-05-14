@@ -1,28 +1,31 @@
 const pool = require('../db/pool');
 const { extractTxnId, extractAmount, findGatewayInSms, extractPayer } = require('./sms.controller');
 
-// Per-provider allowed variants. Add entries here as you support more providers/apps.
-const CATALOG = {
-  bkash:   ['personal', 'agent'],
-  nagad:   ['personal', 'agent'],
-  rocket:  ['personal', 'agent'],
-};
 const CHARGE_TYPES = ['fixed', 'percent'];
 
+// Validate provider+variant against the DB catalog.
+// Returns an error message string, or null on success.
+async function validateProviderVariant(provider, variant) {
+  if (!provider) return 'Invalid provider';
+  const r = await pool.query(
+    `SELECT variants FROM providers WHERE id = $1 AND is_enabled = TRUE`,
+    [provider]
+  );
+  if (r.rowCount === 0) return `Provider "${provider}" not found or disabled`;
+  const variants = r.rows[0].variants || [];
+  if (!variants.includes(variant)) {
+    return `Invalid variant for ${provider}. Allowed: ${variants.join(', ')}`;
+  }
+  return null;
+}
+
 function validateBody(body) {
-  const provider = String(body.provider || '').toLowerCase();
-  const variant  = String(body.variant  || '').toLowerCase();
   const account_number = String(body.account_number || '').trim();
-
-  if (!CATALOG[provider])                     return 'Invalid provider';
-  if (!CATALOG[provider].includes(variant))   return `Invalid variant for ${provider}. Allowed: ${CATALOG[provider].join(', ')}`;
   if (!account_number)                        return 'Account number is required';
-
   if (body.charge_type && !CHARGE_TYPES.includes(body.charge_type))
     return 'Invalid charge_type';
   if (body.discount_type && !CHARGE_TYPES.includes(body.discount_type))
     return 'Invalid discount_type';
-
   return null;
 }
 
@@ -119,8 +122,11 @@ async function create(req, res, next) {
     const err = validateBody(req.body);
     if (err) return res.status(400).json({ error: err });
 
-    const provider = String(req.body.provider).toLowerCase();
-    const variant  = String(req.body.variant).toLowerCase();
+    const provider = String(req.body.provider || '').toLowerCase();
+    const variant  = String(req.body.variant || '').toLowerCase();
+    const providerErr = await validateProviderVariant(provider, variant);
+    if (providerErr) return res.status(400).json({ error: providerErr });
+
     const account_number = String(req.body.account_number).trim();
 
     const r = await pool.query(
