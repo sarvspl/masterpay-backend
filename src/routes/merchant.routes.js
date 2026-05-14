@@ -19,8 +19,9 @@ router.get   ('/brands',     requireMerchant, ctrl.listBrands);
 router.post  ('/brands',     requireMerchant, ctrl.createBrand);
 router.delete('/brands/:id', requireMerchant, ctrl.deleteBrand);
 
-router.get   ('/devices',     requireMerchant, deviceCtrl.listForMerchant);
-router.delete('/devices/:id', requireMerchant, deviceCtrl.deleteForMerchant);
+router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
+router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);
+router.delete('/devices/:id',     requireMerchant, deviceCtrl.deleteForMerchant);
 
 router.get   ('/gateways',            requireMerchant, gatewayCtrl.list);
 router.post  ('/gateways',            requireMerchant, gatewayCtrl.create);

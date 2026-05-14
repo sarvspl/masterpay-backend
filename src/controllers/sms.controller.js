@@ -298,7 +298,7 @@ async function upload(req, res, next) {
 
     // Touch device last_seen
     await pool.query(
-      `UPDATE devices SET last_seen_at = NOW() WHERE merchant_id = $1 AND device_id = $2`,
+      `UPDATE devices SET last_seen_at = NOW() WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
       [merchantId, device_id]
     );
 

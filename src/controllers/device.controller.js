@@ -22,11 +22,12 @@ async function bind(req, res, next) {
     if (m.rows[0].is_suspended) return res.status(403).json({ error: 'Merchant account is suspended', suspended: true });
     const merchant = m.rows[0];
 
-    // Upsert by (merchant_id, device_id)
+    // Upsert against the partial unique index (only active rows).
+    // If an old unbound row exists for the same device_id, this INSERT creates a fresh active row alongside it.
     const r = await pool.query(
       `INSERT INTO devices (merchant_id, device_id, model, manufacturer, os_version, device_token, last_seen_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       ON CONFLICT (merchant_id, device_id) DO UPDATE
+       ON CONFLICT (merchant_id, device_id) WHERE unbound_at IS NULL DO UPDATE
          SET model        = COALESCE(EXCLUDED.model,        devices.model),
              manufacturer = COALESCE(EXCLUDED.manufacturer, devices.manufacturer),
              os_version   = COALESCE(EXCLUDED.os_version,   devices.os_version),
@@ -63,9 +64,12 @@ async function unbind(req, res, next) {
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
 
+    // Soft-delete: preserve history. Only target the active row.
     const r = await pool.query(
-      `DELETE FROM devices
-        WHERE merchant_id = $1 AND device_id = $2
+      `UPDATE devices
+          SET unbound_at = NOW(),
+              unbound_reason = 'apk_unbind'
+        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL
         RETURNING id`,
       [m.rows[0].id, device_id]
     );
@@ -93,6 +97,7 @@ async function heartbeat(req, res, next) {
         WHERE d.merchant_id = k.merchant_id
           AND d.device_id = $1
           AND k.device_auth_key = $2
+          AND d.unbound_at IS NULL
         RETURNING d.id`,
       [device_id, auth_key]
     );
@@ -101,7 +106,7 @@ async function heartbeat(req, res, next) {
   } catch (e) { next(e); }
 }
 
-/* ─── Merchant-facing: list bound devices ─── */
+/* ─── Merchant-facing: list bound (active) devices + past-device count ─── */
 async function listForMerchant(req, res, next) {
   try {
     const { rows } = await pool.query(
@@ -109,8 +114,28 @@ async function listForMerchant(req, res, next) {
               last_seen_at, created_at,
               (last_seen_at IS NOT NULL AND last_seen_at > NOW() - INTERVAL '5 minutes') AS is_online
          FROM devices
-        WHERE merchant_id = $1
+        WHERE merchant_id = $1 AND unbound_at IS NULL
         ORDER BY created_at DESC`,
+      [req.merchant.id]
+    );
+    const past = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM devices WHERE merchant_id = $1 AND unbound_at IS NOT NULL`,
+      [req.merchant.id]
+    );
+    res.json({ devices: rows, past_count: past.rows[0].n });
+  } catch (e) { next(e); }
+}
+
+/* ─── Merchant-facing: list past (unbound) devices, newest unbound first ─── */
+async function listHistoryForMerchant(req, res, next) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, device_id, model, manufacturer, os_version,
+              last_seen_at, created_at, unbound_at, unbound_reason
+         FROM devices
+        WHERE merchant_id = $1 AND unbound_at IS NOT NULL
+        ORDER BY unbound_at DESC
+        LIMIT 100`,
       [req.merchant.id]
     );
     res.json({ devices: rows });
@@ -139,10 +164,10 @@ async function poll(req, res, next) {
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
 
-    // Touch device last_seen (acts as heartbeat too)
+    // Touch device last_seen (acts as heartbeat too) — only the active row
     await pool.query(
       `UPDATE devices SET last_seen_at = NOW()
-        WHERE merchant_id = $1 AND device_id = $2`,
+        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
       [m.rows[0].merchant_id, device_id]
     );
 
@@ -226,16 +251,23 @@ async function report(req, res, next) {
   } catch (e) { next(e); }
 }
 
-/* ─── Merchant-facing: unbind a device ─── */
+/* ─── Merchant-facing: unbind a device (soft-delete, preserves history) ─── */
 async function deleteForMerchant(req, res, next) {
   try {
     const r = await pool.query(
-      `DELETE FROM devices WHERE id = $1 AND merchant_id = $2 RETURNING id`,
+      `UPDATE devices
+          SET unbound_at = NOW(),
+              unbound_reason = 'merchant_delete'
+        WHERE id = $1 AND merchant_id = $2 AND unbound_at IS NULL
+        RETURNING id`,
       [req.params.id, req.merchant.id]
     );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Device not found' });
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Device not found or already unbound' });
     res.json({ ok: true });
   } catch (e) { next(e); }
 }
 
-module.exports = { bind, unbind, heartbeat, poll, report, listForMerchant, deleteForMerchant };
+module.exports = {
+  bind, unbind, heartbeat, poll, report,
+  listForMerchant, listHistoryForMerchant, deleteForMerchant,
+};
