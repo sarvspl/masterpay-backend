@@ -39,6 +39,26 @@ function extractAmount(body) {
   return null;
 }
 
+/**
+ * Detect whether the SMS represents money coming IN (credit) or going OUT (debit).
+ * Returns 'credit', 'debit', or 'unknown'.
+ *
+ * Only credit SMS produce transactions — debit SMS are stored but never create a record,
+ * because money LEAVING the merchant's account is not a customer payment.
+ */
+function extractDirection(body) {
+  const t = String(body || '').toLowerCase();
+  if (!t) return 'unknown';
+
+  // Check debit FIRST — if an SMS mentions both (rare), treat as debit out of caution.
+  const debitRe  = /\b(debited|withdrawn|sent\s+(?:rs|inr|tk|₹|৳|\$|to)|paid\s+(?:rs|inr|tk|₹|৳|\$|to)|cash\s*out|transferred\s+to|spent)\b/;
+  const creditRe = /\b(credited|received|deposit(?:ed)?|cash\s*in|payment\s+received|p2a)\b/;
+
+  if (debitRe.test(t))  return 'debit';
+  if (creditRe.test(t)) return 'credit';
+  return 'unknown';
+}
+
 // Extract the payer (sender) info from the SMS body.
 // Returns { name, phone } — either or both may be null.
 function extractPayer(body) {
@@ -144,6 +164,9 @@ function smsMatchesTransaction(smsBody, tx) {
  * Returns the new transaction id, or null if we couldn't extract enough data.
  */
 async function tryCreateInbound(client, merchantId, smsId, sender, smsBody) {
+  // Skip debit (outgoing) SMS entirely — these are NOT customer payments.
+  if (extractDirection(smsBody) === 'debit') return null;
+
   // Load this merchant's enabled gateways
   const gws = await client.query(
     `SELECT id, provider, variant, account_number FROM gateways
@@ -193,6 +216,9 @@ async function tryCreateInbound(client, merchantId, smsId, sender, smsBody) {
  * Returns the matched transaction id, or null.
  */
 async function tryAutoMatch(client, merchantId, smsId, smsBody) {
+  // Skip debit (outgoing) SMS — money LEAVING the merchant can never be a customer payment.
+  if (extractDirection(smsBody) === 'debit') return null;
+
   const pending = await client.query(
     `SELECT id, txnid_submitted, amount, customer_phone, session_id
        FROM transactions
@@ -426,6 +452,16 @@ async function verifyTxnIdManually(req, res, next) {
 
     const smsRow = sms.rows[0];
 
+    // 3a. Reject if the SMS is a DEBIT (money out) — not a customer payment.
+    if (extractDirection(smsRow.body) === 'debit') {
+      return res.json({
+        matched: false,
+        reason: 'debit_sms',
+        message: 'Found an SMS with this TxnID, but it\'s a debit (money sent OUT, not a payment received). Ignored.',
+        sms: smsRow,
+      });
+    }
+
     // 3. Extract amount from the SMS.
     const amount = extractAmount(smsRow.body);
     if (amount == null) {
@@ -517,5 +553,5 @@ async function verifyTxnIdManually(req, res, next) {
 module.exports = {
   upload, listForMerchant, smsMatchesTransaction, verifyTxnIdManually,
   // Exposed for cross-controller use (e.g. re-scan after a new gateway is added)
-  extractTxnId, extractAmount, findGatewayInSms, extractPayer,
+  extractTxnId, extractAmount, findGatewayInSms, extractPayer, extractDirection,
 };

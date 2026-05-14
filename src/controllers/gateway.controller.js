@@ -1,5 +1,5 @@
 const pool = require('../db/pool');
-const { extractTxnId, extractAmount, findGatewayInSms, extractPayer } = require('./sms.controller');
+const { extractTxnId, extractAmount, findGatewayInSms, extractPayer, extractDirection } = require('./sms.controller');
 
 const CHARGE_TYPES = ['fixed', 'percent'];
 
@@ -58,6 +58,9 @@ async function rescanUnmatchedSms(merchantId, gateway) {
   let count = 0;
 
   for (const s of sms.rows) {
+    // Skip debit (outgoing) SMS — never a customer payment
+    if (extractDirection(s.body) === 'debit') continue;
+
     const hit = findGatewayInSms(s.body, gws);
     if (!hit) continue;
     const txnid = extractTxnId(s.body);
