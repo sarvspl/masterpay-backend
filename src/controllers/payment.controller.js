@@ -1,5 +1,7 @@
 const pool = require('../db/pool');
 const { generateSessionId } = require('../utils/session');
+const { notifyVerifyRequest } = require('../utils/push');
+const smsCtrl = require('./sms.controller');
 
 const SESSION_TTL_MIN = 30;
 
@@ -131,7 +133,16 @@ async function listCheckoutGateways(req, res, next) {
 /**
  * POST /api/checkout/:sessionId/submit
  * Body: { gateway_id, txnid }
- * Creates a transaction row with status='pending'. APK (or manual button) resolves it.
+ *
+ * Resolution order:
+ *   1. If an SMS already received for this merchant contains this TxnID and
+ *      the amount/gateway matches → create a success transaction immediately.
+ *   2. If an "inbound" success transaction already exists for this TxnID
+ *      (i.e. SMS arrived first and created its own row with no session_id) →
+ *      claim it for this session.
+ *   3. If this TxnID was already used on a DIFFERENT session → reject (anti-replay).
+ *   4. Otherwise insert a pending transaction and ping the merchant's APK(s)
+ *      via FCM so they can approve/reject from the phone.
  */
 async function submitTxn(req, res, next) {
   try {
@@ -150,28 +161,124 @@ async function submitTxn(req, res, next) {
 
     // Validate gateway belongs to this merchant
     const g = await pool.query(
-      `SELECT id FROM gateways WHERE id = $1 AND merchant_id = $2 AND is_enabled = TRUE`,
+      `SELECT id, provider, variant, account_number, label
+         FROM gateways WHERE id = $1 AND merchant_id = $2 AND is_enabled = TRUE`,
       [gateway_id, s.merchant_id]
     );
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
+    const gateway = g.rows[0];
 
-    // Anti-replay: already used successfully for this merchant?
+    /* ─── (A) Claim an inbound success that arrived from SMS already ─── */
+    //
+    //   tryCreateInbound() may have already created a success row with
+    //   matched_sms set and session_id NULL. If its TxnID matches what the
+    //   customer just typed, link it to this session.
+    const inbound = await pool.query(
+      `SELECT id, amount FROM transactions
+        WHERE merchant_id = $1
+          AND LOWER(txnid_submitted) = LOWER($2)
+          AND status = 'success'
+          AND session_id IS NULL
+        LIMIT 1`,
+      [s.merchant_id, txnid]
+    );
+    if (inbound.rowCount > 0) {
+      // Sanity: amount must match the session amount (don't claim someone else's payment)
+      if (Number(inbound.rows[0].amount) === Number(s.amount)) {
+        const upd = await pool.query(
+          `UPDATE transactions
+              SET session_id = $1, brand_id = $2, customer_phone = COALESCE(customer_phone, $3), updated_at = NOW()
+            WHERE id = $4
+            RETURNING id, status, created_at`,
+          [s.id, s.brand_id, s.customer_phone, inbound.rows[0].id]
+        );
+        await pool.query(
+          `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
+          [s.id]
+        );
+        return res.status(200).json({ transaction: upd.rows[0], auto_matched: 'inbound' });
+      }
+    }
+
+    /* ─── (B) Anti-replay: same TxnID used on another paid session? ─── */
     const reused = await pool.query(
       `SELECT 1 FROM transactions
-        WHERE merchant_id = $1 AND txnid_submitted = $2 AND status = 'success'`,
-      [s.merchant_id, txnid]
+        WHERE merchant_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
+          AND status = 'success' AND session_id IS NOT NULL AND session_id <> $3`,
+      [s.merchant_id, txnid, s.id]
     );
     if (reused.rowCount > 0) {
       return res.status(409).json({ error: 'This Transaction ID has already been used for another payment.' });
     }
 
+    /* ─── (C) Late match: search received SMS for this TxnID ─── */
+    //
+    //   The SMS might be in sms_messages but unmatched (e.g. amount parser
+    //   missed it). Walk the last 15 minutes and try a strict match.
+    const smsRows = await pool.query(
+      `SELECT id, body FROM sms_messages
+        WHERE merchant_id = $1
+          AND received_at > NOW() - INTERVAL '15 minutes'
+          AND LOWER(body) LIKE LOWER('%' || $2 || '%')
+        ORDER BY received_at DESC
+        LIMIT 5`,
+      [s.merchant_id, txnid]
+    );
+    for (const sms of smsRows.rows) {
+      // Reject debit SMS
+      if (smsCtrl.extractDirection(sms.body) === 'debit') continue;
+      // Must reference THIS gateway's account
+      const matchedGw = smsCtrl.findGatewayInSms(sms.body, [gateway]);
+      if (!matchedGw) continue;
+      // Strict txnid + amount check
+      const ok = smsCtrl.smsMatchesTransaction(sms.body, {
+        txnid_submitted: txnid,
+        amount: s.amount,
+        customer_phone: null,         // session phone is optional / often missing in SMS
+      });
+      if (!ok) continue;
+
+      const payer = smsCtrl.extractPayer(sms.body);
+      const ins = await pool.query(
+        `INSERT INTO transactions
+           (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
+            status, result_source, matched_sms, verified_at, payer_name, payer_phone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10)
+         RETURNING id, status, created_at`,
+        [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, s.amount, s.customer_phone,
+         sms.body, payer.name, payer.phone]
+      );
+      await pool.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [ins.rows[0].id, sms.id]);
+      await pool.query(
+        `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
+        [s.id]
+      );
+      return res.status(200).json({ transaction: ins.rows[0], auto_matched: 'sms' });
+    }
+
+    /* ─── (D) No auto-match — create pending and ping the APK(s) ─── */
     const r = await pool.query(
       `INSERT INTO transactions
          (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id, status, created_at`,
-      [s.id, s.merchant_id, s.brand_id, gateway_id, txnid, s.amount, s.customer_phone]
+      [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, s.amount, s.customer_phone]
     );
+
+    // Fire-and-forget — never block the customer's response on push delivery
+    notifyVerifyRequest(s.merchant_id, {
+      verification_id: r.rows[0].id,
+      txnid,
+      amount:          Number(s.amount).toFixed(2),
+      currency:        s.currency,
+      provider:        gateway.provider,
+      account_number:  gateway.account_number,
+      customer_phone:  s.customer_phone,
+      customer_name:   s.customer_name,
+      order_id:        s.order_id,
+      created_at:      r.rows[0].created_at,
+    }).catch((e) => console.warn('[push] notifyVerifyRequest failed:', e.message));
+
     res.status(202).json({ transaction: r.rows[0] });
   } catch (e) { next(e); }
 }

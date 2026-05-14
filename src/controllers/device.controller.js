@@ -179,9 +179,13 @@ async function poll(req, res, next) {
               t.created_at,
               g.provider,
               g.variant,
-              g.account_number
+              g.account_number,
+              s.order_id,
+              s.customer_name,
+              s.currency
          FROM transactions t
          JOIN gateways g ON g.id = t.gateway_id
+         LEFT JOIN payment_sessions s ON s.id = t.session_id
         WHERE t.merchant_id = $1
           AND t.status = 'pending'
         ORDER BY t.created_at ASC
