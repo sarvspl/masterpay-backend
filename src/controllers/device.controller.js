@@ -40,6 +40,44 @@ async function bind(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── APK-facing: unbind / disconnect this device ───
+ *   POST /api/device/unbind  body { auth_key, device_id }
+ *   Called when the user taps "Disconnect" in the app, or before uninstalling.
+ *   Idempotent — calling on an already-unbound device returns 200 with not_found:true.
+ */
+async function unbind(req, res, next) {
+  try {
+    const auth_key = String(req.body.auth_key || '').trim();
+    const device_id = String(req.body.device_id || '').trim();
+    if (!auth_key)  return res.status(400).json({ error: 'auth_key is required' });
+    if (!device_id) return res.status(400).json({ error: 'device_id is required' });
+
+    // Resolve merchant from auth key. Suspended merchants can still unbind
+    // (lets a phone clean up locally even if account is suspended).
+    const m = await pool.query(
+      `SELECT m.id
+         FROM merchants m
+         JOIN merchant_keys k ON k.merchant_id = m.id
+        WHERE k.device_auth_key = $1`,
+      [auth_key]
+    );
+    if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
+
+    const r = await pool.query(
+      `DELETE FROM devices
+        WHERE merchant_id = $1 AND device_id = $2
+        RETURNING id`,
+      [m.rows[0].id, device_id]
+    );
+
+    res.json({
+      ok: true,
+      unbound: r.rowCount > 0,
+      not_found: r.rowCount === 0,
+    });
+  } catch (e) { next(e); }
+}
+
 /* ─── APK-facing: heartbeat keeps the device marked online ─── */
 async function heartbeat(req, res, next) {
   try {
@@ -200,4 +238,4 @@ async function deleteForMerchant(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { bind, heartbeat, poll, report, listForMerchant, deleteForMerchant };
+module.exports = { bind, unbind, heartbeat, poll, report, listForMerchant, deleteForMerchant };
