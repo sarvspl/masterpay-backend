@@ -168,6 +168,20 @@ async function submitTxn(req, res, next) {
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
     const gateway = g.rows[0];
 
+    /* ─── (0) Idempotency: same session already has a pending row for this TxnID ─── */
+    //
+    //   Customer clicked Verify twice (or refreshed and re-submitted).  Return
+    //   the existing pending row instead of creating a duplicate.
+    const existing = await pool.query(
+      `SELECT id, status, created_at FROM transactions
+        WHERE session_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
+        ORDER BY created_at DESC LIMIT 1`,
+      [s.id, txnid]
+    );
+    if (existing.rowCount > 0) {
+      return res.status(200).json({ transaction: existing.rows[0], duplicate_submit: true });
+    }
+
     /* ─── (A) Claim an inbound success that arrived from SMS already ─── */
     //
     //   tryCreateInbound() may have already created a success row with
