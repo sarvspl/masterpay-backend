@@ -112,9 +112,15 @@ function findGatewayInSms(body, gateways) {
 /**
  * Match logic for a single SMS against a single pending transaction.
  * Returns true only if ALL applicable fields match.
+ *
+ * IMPORTANT: amount matching uses extractAmount() so we compare the
+ * *credited* amount specifically (the one attached to "Tk X", "received",
+ * etc.), NOT just any number that appears in the body. Otherwise the
+ * "Balance Tk 300.50" line in a bKash SMS could false-positive a
+ * 300-rupee session that the customer actually paid 1 rupee for.
  */
 function smsMatchesTransaction(smsBody, tx) {
-  const body = String(smsBody || '').toLowerCase();
+  const body = String(smsBody || '');
   if (!body) return false;
 
   // 1. TxnID must appear as a standalone token (case-insensitive),
@@ -122,30 +128,15 @@ function smsMatchesTransaction(smsBody, tx) {
   const txnid = String(tx.txnid_submitted || '').toLowerCase();
   if (!txnid) return false;
   const txnRe = new RegExp(`(?<![a-z0-9])${escapeRegex(txnid)}(?![a-z0-9])`, 'i');
-  if (!txnRe.test(body)) return false;
+  if (!txnRe.test(body.toLowerCase())) return false;
 
-  // 2. Amount must appear as a standalone number — not embedded in another number
-  //    or word. e.g. amount 300 should NOT match "TXN300" or "30000".
-  //    Acceptable forms for 500 → "500", "500.00", "500.0".
-  //    For 500.50 → "500.50", "500.5".
-  const amount = Number(tx.amount);
-  const isWhole = amount === Math.trunc(amount);
-  const intStr  = String(Math.trunc(amount));
-  const decStr  = amount.toFixed(2);
-  const candidates = isWhole
-    ? [intStr + '.00', intStr + '.0', intStr]
-    : [decStr, decStr.replace(/0$/, '')];
-
-  const amountMatched = candidates.some((c) => {
-    // Reject both letters AND digits before/after, so:
-    //   "Tk 300"   → matches (space before, end-of-word after)
-    //   "TXN300"   → does NOT match (letter N before)
-    //   "30000"    → does NOT match (digit after)
-    //   "300.000"  → does NOT match the bare "300" (digit after the .00)
-    const re = new RegExp(`(?<![a-z0-9])${escapeRegex(c)}(?![a-z0-9])`, 'i');
-    return re.test(body);
-  });
-  if (!amountMatched) return false;
+  // 2. Amount: compare the SMS's parsed "credited" amount to the transaction
+  //    amount with a 1-paisa tolerance. Anchors via currency keywords / verbs
+  //    so balance / fee figures in the same SMS can't accidentally match.
+  const expected = Number(tx.amount);
+  const parsed   = extractAmount(body);
+  if (parsed == null) return false;
+  if (Math.abs(parsed - expected) > 0.01) return false;
 
   // 3. If customer_phone is set, the last 8 digits must appear in the SMS digit stream.
   if (tx.customer_phone) {
