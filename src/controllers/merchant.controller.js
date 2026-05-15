@@ -129,6 +129,7 @@ async function login(req, res, next) {
         error: rows[0].suspended_reason
           ? `Your account is suspended: ${rows[0].suspended_reason}`
           : 'Your account is suspended. Contact support.',
+        suspended: true,
       });
     }
 

@@ -184,18 +184,48 @@ async function createMerchant(req, res, next) {
 async function suspendMerchant(req, res, next) {
   try {
     const reason = req.body.reason ? String(req.body.reason).slice(0, 240) : null;
-    const r = await pool.query(
-      `UPDATE merchants
-          SET is_suspended = TRUE,
-              suspended_at = NOW(),
-              suspended_reason = $2,
-              updated_at = NOW()
-        WHERE id = $1
-        RETURNING id, is_suspended, suspended_at, suspended_reason`,
-      [req.params.id, reason]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Merchant not found' });
-    res.json({ ok: true, merchant: r.rows[0] });
+    const forceUnbind = req.body.force_unbind === true;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const r = await client.query(
+        `UPDATE merchants
+            SET is_suspended = TRUE,
+                suspended_at = NOW(),
+                suspended_reason = $2,
+                updated_at = NOW()
+          WHERE id = $1
+          RETURNING id, is_suspended, suspended_at, suspended_reason`,
+        [req.params.id, reason]
+      );
+      if (r.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Merchant not found' });
+      }
+
+      let unboundCount = 0;
+      if (forceUnbind) {
+        const u = await client.query(
+          `UPDATE devices
+              SET unbound_at = NOW(),
+                  unbound_reason = 'admin_suspend'
+            WHERE merchant_id = $1 AND unbound_at IS NULL
+            RETURNING id`,
+          [req.params.id]
+        );
+        unboundCount = u.rowCount;
+      }
+
+      await client.query('COMMIT');
+      res.json({ ok: true, merchant: r.rows[0], devices_unbound: unboundCount });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      throw e;
+    } finally {
+      client.release();
+    }
   } catch (e) { next(e); }
 }
 

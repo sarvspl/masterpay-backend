@@ -8,6 +8,7 @@ const deviceRoutes = require('./routes/device.routes');
 const paymentRoutes = require('./routes/payment.routes');
 const checkoutRoutes = require('./routes/checkout.routes');
 const providerRoutes = require('./routes/provider.routes');
+const supportCtrl    = require('./controllers/support.controller');
 const { notFound, errorHandler } = require('./middleware/error');
 
 const app = express();
@@ -23,6 +24,8 @@ app.use('/api/device', deviceRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/checkout', checkoutRoutes);
 app.use('/api/providers', providerRoutes);
+
+app.get('/api/support', supportCtrl.getPublic);
 
 app.use(notFound);
 app.use(errorHandler);
