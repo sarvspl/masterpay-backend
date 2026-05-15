@@ -100,11 +100,82 @@ async function listRecharges(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── Platform-wide pricing/settings ─── */
+
+const SETTINGS_FIELDS = [
+  'verify_charge_amount',
+  'verify_charge_currency',
+  'verify_charge_enabled',
+  'low_balance_threshold',
+];
+
+async function getSettings(req, res, next) {
+  try {
+    const r = await pool.query(
+      `SELECT verify_charge_amount, verify_charge_currency, verify_charge_enabled,
+              low_balance_threshold, updated_at
+         FROM platform_settings WHERE id = 1`
+    );
+    res.json({ settings: r.rows[0] || {
+      verify_charge_amount: 0, verify_charge_currency: 'BDT',
+      verify_charge_enabled: false, low_balance_threshold: 0,
+    } });
+  } catch (e) { next(e); }
+}
+
+async function updateSettings(req, res, next) {
+  try {
+    const patch = {};
+    for (const f of SETTINGS_FIELDS) {
+      if (req.body[f] === undefined) continue;
+      patch[f] = req.body[f];
+    }
+
+    // Coerce types + validate
+    if ('verify_charge_amount' in patch) {
+      const n = Number(patch.verify_charge_amount);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'verify_charge_amount must be a non-negative number' });
+      patch.verify_charge_amount = n;
+    }
+    if ('low_balance_threshold' in patch) {
+      const n = Number(patch.low_balance_threshold);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'low_balance_threshold must be a non-negative number' });
+      patch.low_balance_threshold = n;
+    }
+    if ('verify_charge_currency' in patch) {
+      const c = String(patch.verify_charge_currency || '').trim().toUpperCase();
+      if (!/^[A-Z]{3}$/.test(c)) return res.status(400).json({ error: 'verify_charge_currency must be a 3-letter ISO code' });
+      patch.verify_charge_currency = c;
+    }
+    if ('verify_charge_enabled' in patch) patch.verify_charge_enabled = !!patch.verify_charge_enabled;
+
+    if (Object.keys(patch).length === 0) {
+      return getSettings(req, res, next);
+    }
+
+    const sets = [];
+    const params = [];
+    for (const [k, v] of Object.entries(patch)) {
+      params.push(v);
+      sets.push(`${k} = $${params.length}`);
+    }
+    sets.push('updated_at = NOW()');
+
+    const sql = `UPDATE platform_settings SET ${sets.join(', ')} WHERE id = 1
+                 RETURNING verify_charge_amount, verify_charge_currency, verify_charge_enabled,
+                          low_balance_threshold, updated_at`;
+    const r = await pool.query(sql, params);
+    res.json({ settings: r.rows[0] });
+  } catch (e) { next(e); }
+}
+
 module.exports = {
   getPlatformMerchantId,
   asPlatformMerchant,
   getInfo,
   listRecharges,
+  getSettings,
+  updateSettings,
   // The proxied handlers (the same merchant-facing handlers, just with req.merchant injected)
   listGateways:    asPlatformMerchant(gatewayCtrl.list),
   createGateway:   asPlatformMerchant(gatewayCtrl.create),

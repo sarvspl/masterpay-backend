@@ -288,7 +288,19 @@ async function report(req, res, next) {
           .catch((e) => console.error('[wallet] credit failed (apk report):', e.message));
       }
 
-      res.json({ ok: true });
+      // Return the canonical post-update state so clients can validate without
+      // a follow-up call (avoids races + makes the response self-describing).
+      res.json({
+        ok: true,
+        verification_id: upd.rows[0].id,
+        status: upd.rows[0].status,        // 'success' or 'failed' — never 'pending'
+        session_id: upd.rows[0].session_id,
+        transaction: {
+          id: upd.rows[0].id,
+          status: upd.rows[0].status,
+          result_source: 'apk',
+        },
+      });
     } catch (e) {
       // Another row with the same TxnID is already success for this merchant.
       // Treat as already-resolved (idempotent) rather than 500ing.

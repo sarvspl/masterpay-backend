@@ -25,6 +25,8 @@ router.put('/support',   requireAdmin, supportCtrl.updateForAdmin);
 
 /* Platform merchant — receives wallet topups from real merchants */
 router.get('/platform',                       requireAdmin, platformCtrl.getInfo);
+router.get('/platform/settings',              requireAdmin, platformCtrl.getSettings);
+router.put('/platform/settings',              requireAdmin, platformCtrl.updateSettings);
 router.get('/platform/recharges',             requireAdmin, platformCtrl.listRecharges);
 router.get('/platform/gateways',              requireAdmin, platformCtrl.listGateways);
 router.post('/platform/gateways',             requireAdmin, platformCtrl.createGateway);
