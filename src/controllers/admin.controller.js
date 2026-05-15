@@ -46,6 +46,7 @@ async function listMerchants(req, res, next) {
          FROM merchants m
          JOIN merchant_keys k ON k.merchant_id = m.id
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
+        WHERE m.is_platform = FALSE
         ORDER BY m.created_at DESC`
     );
     const merchants = rows.map((r) => ({

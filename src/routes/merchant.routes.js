@@ -4,6 +4,7 @@ const deviceCtrl = require('../controllers/device.controller');
 const gatewayCtrl = require('../controllers/gateway.controller');
 const paymentCtrl = require('../controllers/payment.controller');
 const smsCtrl = require('../controllers/sms.controller');
+const walletCtrl = require('../controllers/wallet.controller');
 const { requireMerchant } = require('../middleware/auth');
 
 const router = express.Router();
@@ -34,5 +35,9 @@ router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manua
 
 router.get   ('/sms',        requireMerchant, smsCtrl.listForMerchant);
 router.post  ('/verify',     requireMerchant, smsCtrl.verifyTxnIdManually);
+
+router.get   ('/wallet',            requireMerchant, walletCtrl.getWallet);
+router.get   ('/wallet/recharges',  requireMerchant, walletCtrl.listRecharges);
+router.post  ('/wallet/recharge',   requireMerchant, walletCtrl.startRecharge);
 
 module.exports = router;

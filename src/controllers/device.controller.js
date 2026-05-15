@@ -283,6 +283,9 @@ async function report(req, res, next) {
           `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
           [upd.rows[0].session_id]
         );
+        const { creditWalletIfTopup } = require('../services/wallet');
+        await creditWalletIfTopup(upd.rows[0].session_id)
+          .catch((e) => console.error('[wallet] credit failed (apk report):', e.message));
       }
 
       res.json({ ok: true });

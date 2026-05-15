@@ -2,6 +2,7 @@ const pool = require('../db/pool');
 const { generateSessionId } = require('../utils/session');
 const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
+const { creditWalletIfTopup } = require('../services/wallet');
 
 const SESSION_TTL_MIN = 30;
 
@@ -234,6 +235,7 @@ async function submitTxn(req, res, next) {
           `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
           [s.id]
         );
+        await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (inbound claim):', e.message));
         return res.status(200).json({ transaction: upd.rows[0], auto_matched: 'inbound' });
       }
     }
@@ -282,6 +284,7 @@ async function submitTxn(req, res, next) {
         `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
         [s.id]
       );
+      await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (late sms):', e.message));
       return res.status(200).json({ transaction: ins.rows[0], auto_matched: 'sms' });
     }
 
@@ -338,6 +341,7 @@ async function checkoutStatus(req, res, next) {
     if (lastTx && lastTx.status === 'success' && s.status === 'pending') {
       await pool.query(`UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1`, [s.id]);
       sessionStatus = 'success';
+      await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (status promo):', e.message));
     }
 
     res.json({
@@ -448,6 +452,7 @@ async function manualResolve(req, res, next) {
         `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
         [r.rows[0].session_id]
       );
+      await creditWalletIfTopup(r.rows[0].session_id).catch((e) => console.error('[wallet] credit failed (manual resolve):', e.message));
     }
     res.json({ ok: true });
   } catch (e) {

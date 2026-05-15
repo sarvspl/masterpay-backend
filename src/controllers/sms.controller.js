@@ -253,6 +253,11 @@ async function tryAutoMatch(client, merchantId, smsId, smsBody) {
           WHERE id = $1 AND status = 'pending'`,
         [tx.session_id]
       );
+      // If this session was a wallet topup, credit the originating merchant.
+      try {
+        const { creditWalletIfTopup } = require('../services/wallet');
+        await creditWalletIfTopup(tx.session_id, client);
+      } catch (e) { console.error('[wallet] credit failed (sms auto-match):', e.message); }
       return tx.id;
     }
   }
