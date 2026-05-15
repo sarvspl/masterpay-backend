@@ -168,18 +168,42 @@ async function submitTxn(req, res, next) {
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
     const gateway = g.rows[0];
 
-    /* ─── (0) Idempotency: same session already has a pending row for this TxnID ─── */
+    /* ─── (0) Idempotency: this merchant already has a transaction for this TxnID ─── */
     //
-    //   Customer clicked Verify twice (or refreshed and re-submitted).  Return
-    //   the existing pending row instead of creating a duplicate.
+    //   A TxnID is supposed to be globally unique (it's a wallet transaction id),
+    //   so seeing one twice is either a retry / accidental double-submit, or an
+    //   attempt to reuse one payment for two orders. Either way we never want a
+    //   second row — return whatever state the first one is in.
     const existing = await pool.query(
-      `SELECT id, status, created_at FROM transactions
-        WHERE session_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
+      `SELECT id, session_id, status, amount, created_at, failure_reason
+         FROM transactions
+        WHERE merchant_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
         ORDER BY created_at DESC LIMIT 1`,
-      [s.id, txnid]
+      [s.merchant_id, txnid]
     );
     if (existing.rowCount > 0) {
-      return res.status(200).json({ transaction: existing.rows[0], duplicate_submit: true });
+      const e = existing.rows[0];
+
+      // Same session → idempotent retry.
+      if (e.session_id === s.id) {
+        return res.status(200).json({ transaction: e, duplicate_submit: true });
+      }
+
+      // Inbound success (no session yet) with matching amount → fall through to Path A claim logic.
+      const isClaimableInbound =
+        e.status === 'success' && e.session_id === null && Number(e.amount) === Number(s.amount);
+      if (!isClaimableInbound) {
+        // Anything else: this TxnID is already accounted for on another order.
+        // Return the existing transaction's state instead of creating a duplicate.
+        return res.status(409).json({
+          error:
+            e.status === 'success' ? 'This Transaction ID has already been used for another payment.' :
+            e.status === 'failed'  ? 'This Transaction ID was already rejected. Please use a fresh transaction.' :
+            /* pending */            'This Transaction ID is already being verified for another order.',
+          existing_status: e.status,
+          transaction: e,
+        });
+      }
     }
 
     /* ─── (A) Claim an inbound success that arrived from SMS already ─── */
@@ -214,16 +238,7 @@ async function submitTxn(req, res, next) {
       }
     }
 
-    /* ─── (B) Anti-replay: same TxnID used on another paid session? ─── */
-    const reused = await pool.query(
-      `SELECT 1 FROM transactions
-        WHERE merchant_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
-          AND status = 'success' AND session_id IS NOT NULL AND session_id <> $3`,
-      [s.merchant_id, txnid, s.id]
-    );
-    if (reused.rowCount > 0) {
-      return res.status(409).json({ error: 'This Transaction ID has already been used for another payment.' });
-    }
+    /* ─── (B) Anti-replay: handled by Path (0). ─── */
 
     /* ─── (C) Late match: search received SMS for this TxnID ─── */
     //
@@ -379,6 +394,42 @@ async function manualResolve(req, res, next) {
     }
     const reason = req.body.reason ? String(req.body.reason).slice(0, 240) : null;
 
+    // Lookup the target row first so we can detect the dupe-success case
+    // (another row with the same TxnID is already success) BEFORE the UPDATE
+    // would fail at the partial unique index `uniq_tx_merchant_txnid_success`.
+    const target = await pool.query(
+      `SELECT id, session_id, status, txnid_submitted
+         FROM transactions WHERE id = $1 AND merchant_id = $2`,
+      [req.params.id, req.merchant.id]
+    );
+    if (target.rowCount === 0) return res.status(404).json({ error: 'Transaction not found' });
+    if (target.rows[0].status !== 'pending') {
+      return res.status(409).json({
+        error: `Transaction already ${target.rows[0].status}.`,
+        existing_status: target.rows[0].status,
+      });
+    }
+
+    // If marking success, check for an existing success row with the same TxnID.
+    // Surface it as a graceful response instead of leaking the unique-violation.
+    if (result === 'success') {
+      const dup = await pool.query(
+        `SELECT id, session_id FROM transactions
+          WHERE merchant_id = $1
+            AND LOWER(txnid_submitted) = LOWER($2)
+            AND status = 'success'
+          LIMIT 1`,
+        [req.merchant.id, target.rows[0].txnid_submitted]
+      );
+      if (dup.rowCount > 0) {
+        return res.status(409).json({
+          error: 'This Transaction ID is already marked Paid on another order.',
+          existing_success_id: dup.rows[0].id,
+          existing_session_id: dup.rows[0].session_id,
+        });
+      }
+    }
+
     const r = await pool.query(
       `UPDATE transactions
           SET status = $1,
@@ -399,7 +450,13 @@ async function manualResolve(req, res, next) {
       );
     }
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    // Defensive: in case of a race we lost between the duplicate check and the UPDATE.
+    if (e && e.code === '23505') {
+      return res.status(409).json({ error: 'This Transaction ID is already marked Paid on another order.' });
+    }
+    next(e);
+  }
 }
 
 module.exports = {

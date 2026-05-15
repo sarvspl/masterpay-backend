@@ -1,4 +1,18 @@
 const pool = require('../db/pool');
+const { verifyTxnIdForMerchant } = require('./sms.controller');
+
+/* Internal: resolve merchant_id from device auth_key. Returns merchant_id or null. */
+async function resolveMerchantFromAuthKey(auth_key) {
+  const m = await pool.query(
+    `SELECT m.id AS merchant_id, m.is_suspended
+       FROM merchants m
+       JOIN merchant_keys k ON k.merchant_id = m.id
+      WHERE k.device_auth_key = $1`,
+    [auth_key]
+  );
+  if (m.rowCount === 0) return null;
+  return m.rows[0];
+}
 
 /* ─── APK-facing: bind a device using the merchant's device_auth_key ─── */
 async function bind(req, res, next) {
@@ -241,36 +255,125 @@ async function report(req, res, next) {
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
 
-    const upd = await pool.query(
-      `UPDATE transactions
-          SET status = $1,
-              result_source = 'apk',
-              result_device_id = $2,
-              matched_sms = $3,
-              failure_reason = $4,
-              verified_at = NOW(),
-              updated_at = NOW()
-        WHERE id = $5 AND merchant_id = $6 AND status = 'pending'
-        RETURNING id, session_id, status`,
-      [
-        result, device_id,
-        result === 'success' ? (req.body.matched_sms || null) : null,
-        result === 'failed' ? (req.body.failure_reason || 'No matching SMS') : null,
-        verification_id, m.rows[0].merchant_id,
-      ]
-    );
-    if (upd.rowCount === 0) {
-      return res.status(404).json({ error: 'Verification not found or already resolved' });
-    }
-
-    if (result === 'success') {
-      await pool.query(
-        `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
-        [upd.rows[0].session_id]
+    try {
+      const upd = await pool.query(
+        `UPDATE transactions
+            SET status = $1,
+                result_source = 'apk',
+                result_device_id = $2,
+                matched_sms = $3,
+                failure_reason = $4,
+                verified_at = NOW(),
+                updated_at = NOW()
+          WHERE id = $5 AND merchant_id = $6 AND status = 'pending'
+          RETURNING id, session_id, status`,
+        [
+          result, device_id,
+          result === 'success' ? (req.body.matched_sms || null) : null,
+          result === 'failed' ? (req.body.failure_reason || 'No matching SMS') : null,
+          verification_id, m.rows[0].merchant_id,
+        ]
       );
+      if (upd.rowCount === 0) {
+        return res.status(404).json({ error: 'Verification not found or already resolved' });
+      }
+
+      if (result === 'success') {
+        await pool.query(
+          `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
+          [upd.rows[0].session_id]
+        );
+      }
+
+      res.json({ ok: true });
+    } catch (e) {
+      // Another row with the same TxnID is already success for this merchant.
+      // Treat as already-resolved (idempotent) rather than 500ing.
+      if (e && e.code === '23505') {
+        return res.status(409).json({ error: 'This Transaction ID is already marked Paid on another order.' });
+      }
+      throw e;
+    }
+  } catch (e) { next(e); }
+}
+
+/* ─── APK-facing: list transactions (pending + history) ───
+ *   POST /api/device/transactions
+ *   body { auth_key, device_id, status?, q?, limit? }
+ *
+ *   status — 'pending' | 'success' | 'failed' | undefined (all)
+ *   q      — search TxnID or order_id (LIKE %q%, case-insensitive)
+ *   limit  — default 50, max 200
+ */
+async function listTransactionsForDevice(req, res, next) {
+  try {
+    const auth_key = String(req.body.auth_key || '').trim();
+    const device_id = String(req.body.device_id || '').trim();
+    if (!auth_key || !device_id) {
+      return res.status(400).json({ error: 'auth_key and device_id required' });
     }
 
-    res.json({ ok: true });
+    const merchant = await resolveMerchantFromAuthKey(auth_key);
+    if (!merchant) return res.status(401).json({ error: 'Invalid device auth key' });
+    if (merchant.is_suspended) return res.status(403).json({ error: 'Merchant account is suspended', suspended: true });
+
+    await pool.query(
+      `UPDATE devices SET last_seen_at = NOW()
+        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
+      [merchant.merchant_id, device_id]
+    );
+
+    const status = ['pending', 'success', 'failed'].includes(req.body.status) ? req.body.status : null;
+    const q = req.body.q ? String(req.body.q).trim() : null;
+    const limit = Math.min(200, Number(req.body.limit) || 50);
+
+    const params = [merchant.merchant_id];
+    let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
+                      t.result_source, t.verified_at, t.failure_reason, t.created_at,
+                      t.payer_name, t.payer_phone,
+                      g.provider, g.variant, g.account_number, g.label AS gateway_label,
+                      s.order_id, s.currency AS session_currency, s.customer_name
+                 FROM transactions t
+                 JOIN gateways g ON g.id = t.gateway_id
+                 LEFT JOIN payment_sessions s ON s.id = t.session_id
+                WHERE t.merchant_id = $1`;
+    if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
+    if (q)      { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
+    sql += ` ORDER BY t.created_at DESC LIMIT ${limit}`;
+
+    const r = await pool.query(sql, params);
+    res.json({ transactions: r.rows });
+  } catch (e) { next(e); }
+}
+
+/* ─── APK-facing: paste a TxnID, the server searches received SMS and resolves it ───
+ *   POST /api/device/verify
+ *   body { auth_key, device_id, txnid }
+ *
+ *   Mirror of /api/merchant/verify but authed by auth_key instead of JWT.
+ *   Same response shapes — { matched, transaction?, sms?, reason?, message? }.
+ */
+async function verifyTxnIdFromDevice(req, res, next) {
+  try {
+    const auth_key = String(req.body.auth_key || '').trim();
+    const device_id = String(req.body.device_id || '').trim();
+    if (!auth_key || !device_id) {
+      return res.status(400).json({ error: 'auth_key and device_id required' });
+    }
+
+    const merchant = await resolveMerchantFromAuthKey(auth_key);
+    if (!merchant) return res.status(401).json({ error: 'Invalid device auth key' });
+    if (merchant.is_suspended) return res.status(403).json({ error: 'Merchant account is suspended', suspended: true });
+
+    await pool.query(
+      `UPDATE devices SET last_seen_at = NOW()
+        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
+      [merchant.merchant_id, device_id]
+    );
+
+    const out = await verifyTxnIdForMerchant(merchant.merchant_id, req.body.txnid);
+    if (out.error) return res.status(400).json(out);
+    res.json(out);
   } catch (e) { next(e); }
 }
 
@@ -292,5 +395,6 @@ async function deleteForMerchant(req, res, next) {
 
 module.exports = {
   bind, unbind, heartbeat, poll, report,
+  listTransactionsForDevice, verifyTxnIdFromDevice,
   listForMerchant, listHistoryForMerchant, deleteForMerchant,
 };
