@@ -299,7 +299,6 @@ async function upload(req, res, next) {
     );
 
     const stored = [];
-    const matched = [];
 
     const client = await pool.connect();
     try {
@@ -331,17 +330,16 @@ async function upload(req, res, next) {
         const smsId = ins.rows[0].id;
         stored.push(smsId);
 
-        // 1) Try matching against a pending checkout transaction
-        let txId = await tryAutoMatch(client, merchantId, smsId, body);
-
-        // 2) No pending match? Try creating an inbound transaction from the SMS itself
-        let inbound = false;
-        if (!txId) {
-          txId = await tryCreateInbound(client, merchantId, smsId, sender, body);
-          if (txId) inbound = true;
-        }
-
-        if (txId) matched.push({ sms_id: smsId, transaction_id: txId, inbound });
+        // SMS-upload is pure data staging now.  No automatic transaction
+        // creation, no proactive flipping. Verification only happens when:
+        //   1. The customer submits a TxnID on the hosted checkout
+        //      (submitTxn → Path C searches received SMS), OR
+        //   2. The customer's checkout page polls /status while pending
+        //      (checkoutStatus lazy re-match), OR
+        //   3. A merchant clicks Mark Paid / APK Approve manually.
+        //
+        // This eliminates the entire class of false-positive auto-approvals
+        // from random wallet SMS that have nothing to do with a checkout.
 
         await client.query('COMMIT');
       }
@@ -357,8 +355,6 @@ async function upload(req, res, next) {
       received: messages.length,
       stored: stored.length,
       duplicates: messages.length - stored.length,
-      matched_count: matched.length,
-      matches: matched,
     });
   } catch (e) { next(e); }
 }

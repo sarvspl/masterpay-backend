@@ -32,8 +32,51 @@ async function createSession(req, res, next) {
 
     if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
     if (!order_id)                                return res.status(400).json({ error: 'order_id is required' });
+    if (order_id.length > 120)                    return res.status(400).json({ error: 'order_id must be at most 120 characters' });
     if (!redirect_url)                            return res.status(400).json({ error: 'redirect_url is required' });
     try { new URL(redirect_url); } catch { return res.status(400).json({ error: 'redirect_url must be a valid URL' }); }
+
+    const baseUrl = process.env.PUBLIC_CHECKOUT_BASE_URL || 'http://localhost:3000';
+
+    /* ─── Dedup by (merchant_id, order_id): Option B ─── */
+    //
+    //   - If any prior session for this order is success → 409 (anti-double-pay).
+    //   - If a prior session is still pending and not expired → return THAT
+    //     session's checkout_url instead of minting a new one. Idempotent for
+    //     legitimate retries ("customer clicked Buy twice", network blip).
+    //   - All other states (expired, failed, cancelled) → fine to create a new session.
+    const prior = await pool.query(
+      `SELECT id, status, expires_at, amount, currency
+         FROM payment_sessions
+        WHERE merchant_id = $1 AND order_id = $2
+        ORDER BY created_at DESC
+        LIMIT 5`,
+      [req.brand.merchant_id, order_id]
+    );
+
+    const paid = prior.rows.find((r) => r.status === 'success');
+    if (paid) {
+      return res.status(409).json({
+        error: 'This order has already been paid.',
+        existing_session_id: paid.id,
+      });
+    }
+
+    const livePending = prior.rows.find(
+      (r) => r.status === 'pending' && new Date(r.expires_at) > new Date()
+    );
+    if (livePending) {
+      // Idempotent: same order_id, same merchant, prior session still alive →
+      // return the original checkout so the customer continues on the same
+      // session instead of creating a parallel one.
+      return res.status(200).json({
+        session_id:   livePending.id,
+        checkout_url: `${baseUrl}/pay/${livePending.id}`,
+        expires_at:   new Date(livePending.expires_at).toISOString(),
+        status:       'pending',
+        existed:      true,
+      });
+    }
 
     const id = generateSessionId();
     const expiresAt = new Date(Date.now() + SESSION_TTL_MIN * 60 * 1000);
@@ -45,14 +88,19 @@ async function createSession(req, res, next) {
       [id, req.brand.merchant_id, req.brand.brand_id, order_id, amount, currency, customer_phone, customer_name, redirect_url, metadata, expiresAt]
     );
 
-    const baseUrl = process.env.PUBLIC_CHECKOUT_BASE_URL || 'http://localhost:3000';
     res.status(201).json({
       session_id: id,
       checkout_url: `${baseUrl}/pay/${id}`,
       expires_at: expiresAt.toISOString(),
       status: 'pending',
     });
-  } catch (e) { next(e); }
+  } catch (e) {
+    // Defensive: lose a race against the partial unique index uniq_paid_session_per_order
+    if (e && e.code === '23505' && /uniq_paid_session_per_order/.test(e.constraint || '')) {
+      return res.status(409).json({ error: 'This order has already been paid.' });
+    }
+    next(e);
+  }
 }
 
 /**
@@ -325,19 +373,17 @@ async function checkoutStatus(req, res, next) {
     if (!s) return res.status(404).json({ error: 'Session not found' });
     await autoExpire(s);
 
-    // If there's a successful transaction, session is success.
-    const tx = await pool.query(
-      `SELECT id, txnid_submitted, status, failure_reason, verified_at, result_source
-         FROM transactions
-        WHERE session_id = $1
-        ORDER BY created_at DESC LIMIT 1`,
-      [s.id]
-    );
+    let lastTx = await loadLatestTxForSession(s.id);
+
+    // Lazy re-match — if the latest tx is still pending, search received
+    // SMS for a match.  Since SMS upload no longer auto-flips transactions,
+    // this is the path that catches "SMS arrived AFTER customer hit Verify".
+    if (lastTx && lastTx.status === 'pending') {
+      const flipped = await tryLateMatchForSession(s, lastTx);
+      if (flipped) lastTx = await loadLatestTxForSession(s.id);
+    }
 
     let sessionStatus = s.status;
-    const lastTx = tx.rows[0] || null;
-
-    // If a transaction succeeded, promote the session status.
     if (lastTx && lastTx.status === 'success' && s.status === 'pending') {
       await pool.query(`UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1`, [s.id]);
       sessionStatus = 'success';
@@ -350,6 +396,77 @@ async function checkoutStatus(req, res, next) {
       redirect_url: s.redirect_url,
     });
   } catch (e) { next(e); }
+}
+
+async function loadLatestTxForSession(sessionId) {
+  const tx = await pool.query(
+    `SELECT id, txnid_submitted, amount, status, failure_reason, verified_at, result_source, gateway_id
+       FROM transactions
+      WHERE session_id = $1
+      ORDER BY created_at DESC LIMIT 1`,
+    [sessionId]
+  );
+  return tx.rows[0] || null;
+}
+
+/**
+ * Tries to flip a single pending transaction to success by searching received
+ * SMS for a matching TxnID + amount + gateway. Called on every status poll
+ * by the customer's checkout page — at most one DB hit per poll, cheap.
+ *
+ * Returns true if it flipped.
+ */
+async function tryLateMatchForSession(s, lastTx) {
+  if (!lastTx || lastTx.status !== 'pending') return false;
+  const txnid = lastTx.txnid_submitted;
+  if (!txnid) return false;
+
+  // Resolve the gateway used at submit time so we can validate the SMS arrived to
+  // the right account.
+  const g = await pool.query(
+    `SELECT id, provider, variant, account_number, label
+       FROM gateways WHERE id = $1`,
+    [lastTx.gateway_id]
+  );
+  if (g.rowCount === 0) return false;
+  const gateway = g.rows[0];
+
+  const smsRows = await pool.query(
+    `SELECT id, body FROM sms_messages
+      WHERE merchant_id = $1
+        AND received_at > NOW() - INTERVAL '15 minutes'
+        AND LOWER(body) LIKE LOWER('%' || $2 || '%')
+      ORDER BY received_at DESC
+      LIMIT 5`,
+    [s.merchant_id, txnid]
+  );
+  for (const sms of smsRows.rows) {
+    if (smsCtrl.extractDirection(sms.body) === 'debit') continue;
+    if (!smsCtrl.findGatewayInSms(sms.body, [gateway])) continue;
+    const ok = smsCtrl.smsMatchesTransaction(sms.body, {
+      txnid_submitted: txnid,
+      amount: Number(lastTx.amount),
+      customer_phone: null,
+    });
+    if (!ok) continue;
+
+    const payer = smsCtrl.extractPayer(sms.body);
+    await pool.query(
+      `UPDATE transactions
+          SET status='success',
+              result_source='sms_late_match',
+              matched_sms=$2,
+              verified_at=NOW(),
+              updated_at=NOW(),
+              payer_name=COALESCE(payer_name, $3),
+              payer_phone=COALESCE(payer_phone, $4)
+        WHERE id=$1 AND status='pending'`,
+      [lastTx.id, sms.body, payer.name, payer.phone]
+    );
+    await pool.query(`UPDATE sms_messages SET matched_tx_id=$1 WHERE id=$2`, [lastTx.id, sms.id]);
+    return true;
+  }
+  return false;
 }
 
 async function cancelCheckout(req, res, next) {

@@ -149,13 +149,8 @@ async function create(req, res, next) {
       ]
     );
     const gateway = r.rows[0];
-
-    // Retroactively scan recent unmatched SMS for this merchant — any that have
-    // a TxnID + amount AND reference this gateway's account get auto-promoted
-    // to inbound transactions. Cap at last 7 days to keep it bounded.
-    const matched = await rescanUnmatchedSms(req.merchant.id, gateway);
-
-    res.status(201).json({ gateway, retroactively_matched: matched });
+    // Inbound auto-creation was removed — SMS upload is staging-only now.
+    res.status(201).json({ gateway, retroactively_matched: 0 });
   } catch (e) {
     if (e.code === '23505') {
       return res.status(409).json({ error: 'A gateway with this account number already exists for this provider/variant.' });
@@ -195,14 +190,7 @@ async function update(req, res, next) {
       ]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });
-
-    // If account_number changed, retry unmatched SMS against the updated gateway.
-    let matched = 0;
-    if (account_number) {
-      matched = await rescanUnmatchedSms(req.merchant.id, r.rows[0]);
-    }
-
-    res.json({ gateway: r.rows[0], retroactively_matched: matched });
+    res.json({ gateway: r.rows[0], retroactively_matched: 0 });
   } catch (e) { next(e); }
 }
 
