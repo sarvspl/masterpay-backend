@@ -2,7 +2,26 @@ const pool = require('../db/pool');
 const { generateSessionId } = require('../utils/session');
 const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
-const { creditWalletIfTopup } = require('../services/wallet');
+const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
+
+/**
+ * Total amount the customer pays = bill + gateway charge − gateway discount.
+ * Charges/discounts can be flat or percent of the bill. Result is clamped
+ * to ≥ 0 (a discount can't make it negative) and rounded to 2 decimals.
+ */
+function computeGatewayTotal(billAmount, gateway) {
+  const bill = Number(billAmount) || 0;
+  const charge = computeFee(bill, gateway && gateway.charge_value, gateway && gateway.charge_type);
+  const discount = computeFee(bill, gateway && gateway.discount_value, gateway && gateway.discount_type);
+  const total = Math.max(0, bill + charge - discount);
+  return Math.round(total * 100) / 100;
+}
+function computeFee(base, value, type) {
+  const v = Number(value || 0);
+  if (!v) return 0;
+  if (String(type).toLowerCase() === 'percent') return base * (v / 100);
+  return v; // 'flat' or anything else
+}
 
 const SESSION_TTL_MIN = 30;
 
@@ -239,8 +258,11 @@ async function submitTxn(req, res, next) {
       }
 
       // Inbound success (no session yet) with matching amount → fall through to Path A claim logic.
+      // Compare against the TOTAL customer pays (bill + gateway charge − discount),
+      // since inbound rows were created from the SMS's credited amount.
+      const claimTotal = computeGatewayTotal(s.amount, gateway);
       const isClaimableInbound =
-        e.status === 'success' && e.session_id === null && Number(e.amount) === Number(s.amount);
+        e.status === 'success' && e.session_id === null && Number(e.amount) === claimTotal;
       if (!isClaimableInbound) {
         // Anything else: this TxnID is already accounted for on another order.
         // Return the existing transaction's state instead of creating a duplicate.
@@ -270,8 +292,8 @@ async function submitTxn(req, res, next) {
       [s.merchant_id, txnid]
     );
     if (inbound.rowCount > 0) {
-      // Sanity: amount must match the session amount (don't claim someone else's payment)
-      if (Number(inbound.rows[0].amount) === Number(s.amount)) {
+      // Sanity: amount must match the total customer pays (bill + gateway charge − discount).
+      if (Number(inbound.rows[0].amount) === computeGatewayTotal(s.amount, gateway)) {
         const upd = await pool.query(
           `UPDATE transactions
               SET session_id = $1, brand_id = $2, customer_phone = COALESCE(customer_phone, $3), updated_at = NOW()
@@ -284,6 +306,7 @@ async function submitTxn(req, res, next) {
           [s.id]
         );
         await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (inbound claim):', e.message));
+        await debitVerifyFee(s.merchant_id, upd.rows[0].id, s.id).catch((e) => console.error('[wallet] debit failed (inbound claim):', e.message));
         return res.status(200).json({ transaction: upd.rows[0], auto_matched: 'inbound' });
       }
     }
@@ -309,10 +332,12 @@ async function submitTxn(req, res, next) {
       // Must reference THIS gateway's account
       const matchedGw = smsCtrl.findGatewayInSms(sms.body, [gateway]);
       if (!matchedGw) continue;
-      // Strict txnid + amount check
+      // Strict txnid + amount check — match against the TOTAL the customer
+      // pays (bill + gateway charge − discount), not just the bill.
+      const total = computeGatewayTotal(s.amount, gateway);
       const ok = smsCtrl.smsMatchesTransaction(sms.body, {
         txnid_submitted: txnid,
-        amount: s.amount,
+        amount: total,
         customer_phone: null,         // session phone is optional / often missing in SMS
       });
       if (!ok) continue;
@@ -324,7 +349,7 @@ async function submitTxn(req, res, next) {
             status, result_source, matched_sms, verified_at, payer_name, payer_phone)
          VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10)
          RETURNING id, status, created_at`,
-        [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, s.amount, s.customer_phone,
+        [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, total, s.customer_phone,
          sms.body, payer.name, payer.phone]
       );
       await pool.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [ins.rows[0].id, sms.id]);
@@ -333,23 +358,28 @@ async function submitTxn(req, res, next) {
         [s.id]
       );
       await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (late sms):', e.message));
+      await debitVerifyFee(s.merchant_id, ins.rows[0].id, s.id).catch((e) => console.error('[wallet] debit failed (late sms):', e.message));
       return res.status(200).json({ transaction: ins.rows[0], auto_matched: 'sms' });
     }
 
     /* ─── (D) No auto-match — create pending and ping the APK(s) ─── */
+    //   Transaction amount is the TOTAL the customer paid (bill + gateway
+    //   charge − discount), so when the SMS arrives the matcher sees the
+    //   same number.
+    const totalD = computeGatewayTotal(s.amount, gateway);
     const r = await pool.query(
       `INSERT INTO transactions
          (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id, status, created_at`,
-      [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, s.amount, s.customer_phone]
+      [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, totalD, s.customer_phone]
     );
 
     // Fire-and-forget — never block the customer's response on push delivery
     notifyVerifyRequest(s.merchant_id, {
       verification_id: r.rows[0].id,
       txnid,
-      amount:          Number(s.amount).toFixed(2),
+      amount:          Number(totalD).toFixed(2),
       currency:        s.currency,
       provider:        gateway.provider,
       account_number:  gateway.account_number,
@@ -388,6 +418,7 @@ async function checkoutStatus(req, res, next) {
       await pool.query(`UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1`, [s.id]);
       sessionStatus = 'success';
       await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (status promo):', e.message));
+      await debitVerifyFee(s.merchant_id, lastTx.id, s.id).catch((e) => console.error('[wallet] debit failed (status promo):', e.message));
     }
 
     res.json({
@@ -570,6 +601,10 @@ async function manualResolve(req, res, next) {
         [r.rows[0].session_id]
       );
       await creditWalletIfTopup(r.rows[0].session_id).catch((e) => console.error('[wallet] credit failed (manual resolve):', e.message));
+      // Manual resolution still incurs the per-verification fee — the merchant
+      // had to be reachable to click Mark Paid, so they should pay for it.
+      await debitVerifyFee(req.merchant.id, r.rows[0].id, r.rows[0].session_id)
+        .catch((e) => console.error('[wallet] debit failed (manual resolve):', e.message));
     }
     res.json({ ok: true });
   } catch (e) {

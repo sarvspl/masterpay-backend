@@ -165,6 +165,8 @@ async function updateSettings(req, res, next) {
                  RETURNING verify_charge_amount, verify_charge_currency, verify_charge_enabled,
                           low_balance_threshold, updated_at`;
     const r = await pool.query(sql, params);
+    // Bust the wallet service's settings cache so the change takes effect now.
+    try { require('../services/wallet').invalidatePlatformSettingsCache(); } catch {}
     res.json({ settings: r.rows[0] });
   } catch (e) { next(e); }
 }

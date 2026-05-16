@@ -283,9 +283,11 @@ async function report(req, res, next) {
           `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
           [upd.rows[0].session_id]
         );
-        const { creditWalletIfTopup } = require('../services/wallet');
+        const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
         await creditWalletIfTopup(upd.rows[0].session_id)
           .catch((e) => console.error('[wallet] credit failed (apk report):', e.message));
+        await debitVerifyFee(m.rows[0].merchant_id, upd.rows[0].id, upd.rows[0].session_id)
+          .catch((e) => console.error('[wallet] debit failed (apk report):', e.message));
       }
 
       // Return the canonical post-update state so clients can validate without

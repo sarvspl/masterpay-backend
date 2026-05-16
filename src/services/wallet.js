@@ -84,4 +84,162 @@ async function creditWalletIfTopup(sessionId, client = null) {
   }
 }
 
-module.exports = { creditWalletIfTopup };
+/* ─── Per-verification fee (platform → merchant) ─── */
+
+/**
+ * Reads the platform settings. Cached for 10s to avoid hammering the DB
+ * on every verification.
+ */
+let _settingsCache = null;
+let _settingsCacheAt = 0;
+
+async function getPlatformSettings() {
+  const now = Date.now();
+  if (_settingsCache && now - _settingsCacheAt < 10_000) return _settingsCache;
+  const r = await pool.query(
+    `SELECT verify_charge_amount, verify_charge_currency,
+            verify_charge_enabled, low_balance_threshold
+       FROM platform_settings WHERE id = 1`
+  );
+  _settingsCache = r.rows[0] || {
+    verify_charge_amount: 0, verify_charge_currency: 'BDT',
+    verify_charge_enabled: false, low_balance_threshold: 0,
+  };
+  _settingsCacheAt = now;
+  return _settingsCache;
+}
+
+/**
+ * Manually invalidate the settings cache. Called from updateSettings so the
+ * next read after a Save sees the new values immediately.
+ */
+function invalidatePlatformSettingsCache() {
+  _settingsCache = null;
+  _settingsCacheAt = 0;
+}
+
+/**
+ * Check that a merchant's wallet has at least the configured per-verification
+ * fee available. Used by walletGuard middleware before letting an operation
+ * proceed.
+ *
+ * Returns { ok, balance, fee, threshold, enabled, reason? }.
+ *   - ok=true  → operation may proceed
+ *   - ok=false → return 402 to caller with reason
+ *
+ * The platform merchant itself is always considered sufficient (we don't
+ * charge ourselves).
+ */
+async function checkWalletSufficient(merchantId) {
+  const settings = await getPlatformSettings();
+  // If the platform isn't charging, every merchant has effectively infinite credit.
+  if (!settings.verify_charge_enabled || Number(settings.verify_charge_amount) <= 0) {
+    return { ok: true, balance: null, fee: 0, threshold: 0, enabled: false };
+  }
+
+  const m = await pool.query(
+    `SELECT wallet_balance, is_platform FROM merchants WHERE id = $1`,
+    [merchantId]
+  );
+  if (m.rowCount === 0) return { ok: false, reason: 'merchant_not_found' };
+  if (m.rows[0].is_platform) {
+    return { ok: true, balance: null, fee: 0, threshold: 0, enabled: false };
+  }
+
+  const balance = Number(m.rows[0].wallet_balance);
+  const fee     = Number(settings.verify_charge_amount);
+  if (balance < fee) {
+    return {
+      ok: false,
+      balance,
+      fee,
+      threshold: Number(settings.low_balance_threshold),
+      enabled: true,
+      reason: 'insufficient_balance',
+    };
+  }
+  return {
+    ok: true,
+    balance,
+    fee,
+    threshold: Number(settings.low_balance_threshold),
+    enabled: true,
+  };
+}
+
+/**
+ * Debit the per-verification fee from a merchant's wallet for one verified
+ * transaction. Idempotent via unique partial index on
+ * wallet_ledger(source_transaction_id) WHERE kind='debit_verify'.
+ *
+ * Skipped when:
+ *   - charge is disabled or amount is 0
+ *   - the merchant is the platform itself
+ *   - the originating session is a wallet topup (recharging is free)
+ */
+async function debitVerifyFee(merchantId, transactionId, sessionId, client = null) {
+  const settings = await getPlatformSettings();
+  if (!settings.verify_charge_enabled || Number(settings.verify_charge_amount) <= 0) return null;
+
+  const runner = client || pool;
+
+  // Skip platform merchant + wallet topup sessions.
+  const guard = await runner.query(
+    `SELECT m.is_platform,
+            (SELECT (metadata->>'type') FROM payment_sessions WHERE id = $2) AS sess_kind
+       FROM merchants m WHERE m.id = $1`,
+    [merchantId, sessionId || null]
+  );
+  if (guard.rowCount === 0) return null;
+  if (guard.rows[0].is_platform) return null;
+  if (guard.rows[0].sess_kind === 'wallet_topup') return null;
+
+  const fee = Number(settings.verify_charge_amount);
+  const ownsClient = !client;
+  const c = client || await pool.connect();
+  try {
+    if (ownsClient) await c.query('BEGIN');
+
+    // Negative amount = debit; positive = credit. Ledger is the source of truth.
+    let ledger = null;
+    try {
+      const ins = await c.query(
+        `INSERT INTO wallet_ledger (merchant_id, amount, kind, source_transaction_id, note)
+         VALUES ($1, $2, 'debit_verify', $3, $4)
+         RETURNING id, amount, kind, source_transaction_id, created_at`,
+        [merchantId, -fee, transactionId, 'Verification fee']
+      );
+      ledger = ins.rows[0];
+    } catch (e) {
+      if (e.code === '23505') {
+        if (ownsClient) await c.query('ROLLBACK');
+        return null; // already debited for this tx — idempotent
+      }
+      throw e;
+    }
+
+    await c.query(
+      `UPDATE merchants SET wallet_balance = wallet_balance - $1, updated_at = NOW()
+        WHERE id = $2`,
+      [fee, merchantId]
+    );
+
+    if (ownsClient) await c.query('COMMIT');
+    return ledger;
+  } catch (e) {
+    if (ownsClient) {
+      try { await c.query('ROLLBACK'); } catch {}
+    }
+    throw e;
+  } finally {
+    if (ownsClient) c.release();
+  }
+}
+
+module.exports = {
+  creditWalletIfTopup,
+  debitVerifyFee,
+  checkWalletSufficient,
+  getPlatformSettings,
+  invalidatePlatformSettingsCache,
+};
