@@ -131,11 +131,17 @@ async function heartbeat(req, res, next) {
           AND d.device_id = $1
           AND k.device_auth_key = $2
           AND d.unbound_at IS NULL
-        RETURNING d.id`,
+        RETURNING d.id, d.merchant_id`,
       [device_id, auth_key]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Device not bound' });
-    res.json({ ok: true });
+
+    // Attach the merchant's wallet snapshot so the APK's balance pill stays
+    // live (the APK reads `balance` from any response and emits to its bus).
+    const { getWalletStatusForMerchant } = require('../services/wallet');
+    const wallet = await getWalletStatusForMerchant(r.rows[0].merchant_id).catch(() => null);
+
+    res.json({ ok: true, ...(wallet || {}) });
   } catch (e) { next(e); }
 }
 
@@ -225,7 +231,13 @@ async function poll(req, res, next) {
         LIMIT 20`,
       [m.rows[0].merchant_id]
     );
-    res.json({ verifications: r.rows });
+
+    // Include the wallet snapshot so the APK balance pill updates from a poll
+    // response (no extra round-trip needed).
+    const { getWalletStatusForMerchant } = require('../services/wallet');
+    const wallet = await getWalletStatusForMerchant(m.rows[0].merchant_id).catch(() => null);
+
+    res.json({ verifications: r.rows, ...(wallet || {}) });
   } catch (e) { next(e); }
 }
 

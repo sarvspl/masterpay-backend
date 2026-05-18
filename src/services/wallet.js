@@ -249,10 +249,34 @@ async function debitVerifyFee(merchantId, transactionId, sessionId, client = nul
   }
 }
 
+/**
+ * Get the merchant's current wallet snapshot for inclusion in successful
+ * device-endpoint responses. Lets the APK keep its balance pill live without
+ * a separate API call.
+ *
+ * Returns { balance, fee, threshold } — fee/threshold from platform_settings,
+ * balance from the merchant row. Returns null for the platform merchant
+ * itself (no balance to show).
+ */
+async function getWalletStatusForMerchant(merchantId) {
+  const m = await pool.query(
+    `SELECT wallet_balance, is_platform FROM merchants WHERE id = $1`,
+    [merchantId]
+  );
+  if (m.rowCount === 0 || m.rows[0].is_platform) return null;
+  const settings = await getPlatformSettings();
+  return {
+    balance:   Number(m.rows[0].wallet_balance),
+    fee:       Number(settings.verify_charge_amount || 0),
+    threshold: Number(settings.low_balance_threshold || 0),
+  };
+}
+
 module.exports = {
   creditWalletIfTopup,
   debitVerifyFee,
   checkWalletSufficient,
+  getWalletStatusForMerchant,
   getPlatformSettings,
   invalidatePlatformSettingsCache,
 };
