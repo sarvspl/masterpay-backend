@@ -14,6 +14,7 @@ router.get('/merchants/:id', requireAdmin, ctrl.getMerchant);
 router.post('/merchants', requireAdmin, ctrl.createMerchant);
 router.post('/merchants/:id/suspend',   requireAdmin, ctrl.suspendMerchant);
 router.post('/merchants/:id/unsuspend', requireAdmin, ctrl.unsuspendMerchant);
+router.post('/merchants/:id/wallet',    requireAdmin, ctrl.adjustWallet);
 
 router.get   ('/providers',     requireAdmin, provCtrl.adminList);
 router.post  ('/providers',     requireAdmin, provCtrl.adminCreate);

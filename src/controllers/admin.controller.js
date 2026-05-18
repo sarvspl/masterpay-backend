@@ -247,4 +247,88 @@ async function unsuspendMerchant(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { login, listMerchants, getMerchant, createMerchant, suspendMerchant, unsuspendMerchant };
+/* ─── Super-admin wallet adjustment ───
+ *   POST /admin/merchants/:id/wallet
+ *   body: { amount: number, note?: string }
+ *     amount > 0  → credit
+ *     amount < 0  → debit  (refuses to go below 0)
+ *   Writes an audit row in wallet_ledger (kind='adjustment') and updates
+ *   merchants.wallet_balance in one transaction.
+ */
+async function adjustWallet(req, res, next) {
+  const client = await pool.connect();
+  try {
+    const merchantId = req.params.id;
+    const amount = Number(req.body && req.body.amount);
+    const note = String((req.body && req.body.note) || '').slice(0, 500) || 'Admin adjustment';
+
+    if (!Number.isFinite(amount) || amount === 0) {
+      return res.status(400).json({ error: 'amount must be a non-zero number' });
+    }
+    if (Math.abs(amount) > 10_000_000) {
+      return res.status(400).json({ error: 'amount out of range' });
+    }
+
+    await client.query('BEGIN');
+
+    const m = await client.query(
+      `SELECT id, name, wallet_balance, is_platform
+         FROM merchants
+        WHERE id = $1
+        FOR UPDATE`,
+      [merchantId]
+    );
+    if (m.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Merchant not found' });
+    }
+    if (m.rows[0].is_platform) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Cannot adjust the platform merchant' });
+    }
+
+    const currentBalance = Number(m.rows[0].wallet_balance);
+    const newBalance = currentBalance + amount;
+    if (newBalance < 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Insufficient balance for this debit',
+        balance: currentBalance,
+      });
+    }
+
+    const ledger = await client.query(
+      `INSERT INTO wallet_ledger (merchant_id, amount, kind, note)
+       VALUES ($1, $2, 'adjustment', $3)
+       RETURNING id, amount, kind, note, created_at`,
+      [merchantId, amount, note]
+    );
+
+    const upd = await client.query(
+      `UPDATE merchants
+          SET wallet_balance = wallet_balance + $1,
+              updated_at     = NOW()
+        WHERE id = $2
+        RETURNING wallet_balance`,
+      [amount, merchantId]
+    );
+
+    await client.query('COMMIT');
+    res.json({
+      ok: true,
+      merchant_id: merchantId,
+      balance: Number(upd.rows[0].wallet_balance),
+      ledger:  ledger.rows[0],
+    });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = {
+  login, listMerchants, getMerchant, createMerchant,
+  suspendMerchant, unsuspendMerchant, adjustWallet,
+};
