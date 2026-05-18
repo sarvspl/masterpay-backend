@@ -524,10 +524,12 @@ async function listTransactions(req, res, next) {
                       t.result_source, t.verified_at, t.failure_reason, t.created_at,
                       t.payer_name, t.payer_phone,
                       g.provider, g.variant, g.account_number, g.label AS gateway_label,
-                      s.order_id, s.currency AS session_currency
+                      s.order_id, s.currency AS session_currency,
+                      b.name AS brand_name, b.domain AS brand_domain
                  FROM transactions t
                  JOIN gateways g ON g.id = t.gateway_id
                  LEFT JOIN payment_sessions s ON s.id = t.session_id
+                 LEFT JOIN brands b ON b.id = COALESCE(t.brand_id, s.brand_id)
                 WHERE t.merchant_id = $1`;
     if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
     if (q)      { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
