@@ -267,6 +267,13 @@ async function report(req, res, next) {
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
 
+    // `failure_reason` is overloaded as a free-form note column across the rest
+    // of the codebase (see payment.controller.js manualResolve), so an approve
+    // flow with a manual note must write here too. Cap to fit VARCHAR(255).
+    const note = req.body.failure_reason
+      ? String(req.body.failure_reason).slice(0, 240)
+      : null;
+
     try {
       const upd = await pool.query(
         `UPDATE transactions
@@ -282,7 +289,9 @@ async function report(req, res, next) {
         [
           result, device_id,
           result === 'success' ? (req.body.matched_sms || null) : null,
-          result === 'failed' ? (req.body.failure_reason || 'No matching SMS') : null,
+          result === 'success'
+            ? note                                   // optional manual note on approve
+            : (note || 'No matching SMS'),           // note (or fallback) on reject
           verification_id, m.rows[0].merchant_id,
         ]
       );

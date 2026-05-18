@@ -631,6 +631,12 @@ async function manualResolve(req, res, next) {
       }
     }
 
+    // Store the optional reason on both outcomes — the column is named
+    // `failure_reason` for historical reasons but it's used as a free-form
+    // "manual note" for any result. Defaults to a placeholder for failed
+    // when the merchant didn't enter one (so the customer's result page has
+    // something to show); success without a reason stays null.
+    const storedReason = reason || (result === 'failed' ? 'Manually marked failed' : null);
     const r = await pool.query(
       `UPDATE transactions
           SET status = $1,
@@ -640,7 +646,7 @@ async function manualResolve(req, res, next) {
               updated_at = NOW()
         WHERE id = $3 AND merchant_id = $4 AND status = 'pending'
         RETURNING id, session_id, status`,
-      [result, result === 'failed' ? (reason || 'Manually marked failed') : null, req.params.id, req.merchant.id]
+      [result, storedReason, req.params.id, req.merchant.id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Pending transaction not found' });
 
