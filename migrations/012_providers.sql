@@ -14,5 +14,5 @@ INSERT INTO providers (id, name, initials, color, variants) VALUES
   ('bkash',  'bKash',  'bK', 'pink',   '["personal","agent"]'::jsonb),
   ('nagad',  'Nagad',  'Na', 'orange', '["personal","agent"]'::jsonb),
   ('rocket', 'Rocket', 'Ro', 'purple', '["personal","agent"]'::jsonb),
-  ('upay',   'Upay',   'Up', 'blue',   '["personal","agent"]'::jsonb)
+  ('upay',   'Upay',   'Up', 'blue',   '["personal"]'::jsonb)
 ON CONFLICT (id) DO NOTHING;
