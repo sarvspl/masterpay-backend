@@ -176,6 +176,9 @@ async function checkWalletSufficient(merchantId) {
  *   - charge is disabled or amount is 0
  *   - the merchant is the platform itself
  *   - the originating session is a wallet topup (recharging is free)
+ *   - DEFENSIVE: the debit would push wallet_balance below 0 (any upstream
+ *     guard that lets a chargeable success slip through finds this safety net
+ *     and silently returns null instead of going into debt).
  */
 async function debitVerifyFee(merchantId, transactionId, sessionId, client = null) {
   const settings = await getPlatformSettings();
@@ -183,9 +186,9 @@ async function debitVerifyFee(merchantId, transactionId, sessionId, client = nul
 
   const runner = client || pool;
 
-  // Skip platform merchant + wallet topup sessions.
+  // Skip platform merchant + wallet topup sessions + current-balance check.
   const guard = await runner.query(
-    `SELECT m.is_platform,
+    `SELECT m.is_platform, m.wallet_balance,
             (SELECT (metadata->>'type') FROM payment_sessions WHERE id = $2) AS sess_kind
        FROM merchants m WHERE m.id = $1`,
     [merchantId, sessionId || null]
@@ -195,6 +198,16 @@ async function debitVerifyFee(merchantId, transactionId, sessionId, client = nul
   if (guard.rows[0].sess_kind === 'wallet_topup') return null;
 
   const fee = Number(settings.verify_charge_amount);
+  const currentBalance = Number(guard.rows[0].wallet_balance);
+  if (currentBalance < fee) {
+    // Defensive — every upstream chargeable path should have rejected the
+    // success flip already. If we get here it's a bug somewhere; refuse to
+    // push negative rather than silently going into debt.
+    console.warn(
+      `[wallet] debit refused — merchant ${merchantId} balance ${currentBalance} < fee ${fee} (tx ${transactionId})`
+    );
+    return null;
+  }
   const ownsClient = !client;
   const c = client || await pool.connect();
   try {

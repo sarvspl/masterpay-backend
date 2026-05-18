@@ -577,6 +577,24 @@ async function manualResolve(req, res, next) {
     }
     const reason = req.body.reason ? String(req.body.reason).slice(0, 240) : null;
 
+    // Wallet gate — only for `success` resolution (debit fires). Marking
+    // failed is free and stays allowed at any balance. Without this check, a
+    // merchant at zero balance clicking Mark Paid would silently push their
+    // wallet negative via the debit hook.
+    if (result === 'success') {
+      const { checkWalletSufficient } = require('../services/wallet');
+      const wallet = await checkWalletSufficient(req.merchant.id);
+      if (!wallet.ok) {
+        return res.status(402).json({
+          error: 'Top up your wallet to resolve pending verifications.',
+          merchant_message:
+            'Marking a verification as Paid debits the per-verification fee, but the wallet balance is below the configured fee. Top up first, then retry.',
+          insufficient_balance: true,
+          code: 'merchant_wallet_empty',
+        });
+      }
+    }
+
     // Lookup the target row first so we can detect the dupe-success case
     // (another row with the same TxnID is already success) BEFORE the UPDATE
     // would fail at the partial unique index `uniq_tx_merchant_txnid_success`.
