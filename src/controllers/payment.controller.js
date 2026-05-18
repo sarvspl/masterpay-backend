@@ -227,12 +227,19 @@ async function submitTxn(req, res, next) {
     // submissions. New pending transactions can't be auto-cleared anyway —
     // APK + lazy re-match are blocked by their own walletGuards — so creating
     // them just clutters the dashboard.
+    //
+    // Response shape mirrors walletGuard.rejectCustomerSafe so the customer
+    // sees a neutral message even if the merchant's integration renders the
+    // raw JSON.
     const { checkWalletSufficient } = require('../services/wallet');
     const wallet = await checkWalletSufficient(s.merchant_id);
     if (!wallet.ok) {
       return res.status(402).json({
-        error: 'This merchant is temporarily unable to accept payments. Please try again later.',
+        error: 'Services currently unavailable.',
+        merchant_message:
+          'Merchant wallet has insufficient balance to cover the per-verification fee. Top up at the dashboard.',
         insufficient_balance: true,
+        code: 'merchant_wallet_empty',
       });
     }
 
