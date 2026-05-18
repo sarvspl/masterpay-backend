@@ -222,6 +222,20 @@ async function submitTxn(req, res, next) {
       return res.status(409).json({ error: `Session is ${s.status}` });
     }
 
+    // Wallet gate: even though the session was created when the merchant had
+    // balance, if they've since gone to zero we shouldn't accept new verify
+    // submissions. New pending transactions can't be auto-cleared anyway —
+    // APK + lazy re-match are blocked by their own walletGuards — so creating
+    // them just clutters the dashboard.
+    const { checkWalletSufficient } = require('../services/wallet');
+    const wallet = await checkWalletSufficient(s.merchant_id);
+    if (!wallet.ok) {
+      return res.status(402).json({
+        error: 'This merchant is temporarily unable to accept payments. Please try again later.',
+        insufficient_balance: true,
+      });
+    }
+
     const gateway_id = String(req.body.gateway_id || '').trim();
     const txnid      = String(req.body.txnid || '').trim();
     if (!gateway_id) return res.status(400).json({ error: 'gateway_id is required' });
@@ -406,11 +420,19 @@ async function checkoutStatus(req, res, next) {
     let lastTx = await loadLatestTxForSession(s.id);
 
     // Lazy re-match — if the latest tx is still pending, search received
-    // SMS for a match.  Since SMS upload no longer auto-flips transactions,
+    // SMS for a match. Since SMS upload no longer auto-flips transactions,
     // this is the path that catches "SMS arrived AFTER customer hit Verify".
+    //
+    // BUT: only fire when the merchant still has wallet balance for the
+    // verification fee. If they've gone to zero, the pending tx stays
+    // pending until they top up (their dashboard banner tells them).
     if (lastTx && lastTx.status === 'pending') {
-      const flipped = await tryLateMatchForSession(s, lastTx);
-      if (flipped) lastTx = await loadLatestTxForSession(s.id);
+      const { checkWalletSufficient } = require('../services/wallet');
+      const wallet = await checkWalletSufficient(s.merchant_id);
+      if (wallet.ok) {
+        const flipped = await tryLateMatchForSession(s, lastTx);
+        if (flipped) lastTx = await loadLatestTxForSession(s.id);
+      }
     }
 
     let sessionStatus = s.status;
