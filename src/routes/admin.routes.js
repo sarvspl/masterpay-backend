@@ -7,6 +7,7 @@ const router = express.Router();
 const provCtrl     = require('../controllers/provider.controller');
 const supportCtrl  = require('../controllers/support.controller');
 const platformCtrl = require('../controllers/platform.controller');
+const ticketsCtrl  = require('../controllers/tickets.controller');
 
 router.post('/login', ctrl.login);
 router.get('/merchants', requireAdmin, ctrl.listMerchants);
@@ -42,5 +43,10 @@ router.get('/platform/devices/history',       requireAdmin, platformCtrl.listDev
 router.delete('/platform/devices/:id',        requireAdmin, platformCtrl.removeDevice);
 router.get('/platform/transactions',          requireAdmin, platformCtrl.listTransactions);
 router.post('/platform/transactions/:id/resolve', requireAdmin, platformCtrl.manualResolveTransaction);
+
+router.get  ('/tickets',                  requireAdmin, ticketsCtrl.adminList);
+router.get  ('/tickets/:id',              requireAdmin, ticketsCtrl.adminGet);
+router.post ('/tickets/:id/messages',     requireAdmin, ticketsCtrl.adminReply);
+router.patch('/tickets/:id',              requireAdmin, ticketsCtrl.adminUpdate);
 
 module.exports = router;
