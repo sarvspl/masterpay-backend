@@ -257,6 +257,29 @@ async function submitTxn(req, res, next) {
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
     const gateway = g.rows[0];
 
+    /* ─── Session-lock: one Verify per session ─── */
+    //
+    //   Once a TxnID has been submitted for this session, the method is locked
+    //   in. A subsequent submit (different gateway, different TxnID, etc.) is
+    //   rejected so the customer can't fork the session across multiple
+    //   pending rows. Idempotent retry of the same TxnID is handled below.
+    const sessionTx = await pool.query(
+      `SELECT id, txnid_submitted, status FROM transactions
+        WHERE session_id = $1
+        ORDER BY created_at DESC LIMIT 1`,
+      [s.id]
+    );
+    if (sessionTx.rowCount > 0) {
+      const t = sessionTx.rows[0];
+      const sameTxn = t.txnid_submitted && t.txnid_submitted.toLowerCase() === txnid.toLowerCase();
+      if (!sameTxn) {
+        return res.status(409).json({
+          error: 'This checkout already has a submitted Transaction ID. You can\'t change the payment method.',
+          existing_status: t.status,
+        });
+      }
+    }
+
     /* ─── (0) Idempotency: this merchant already has a transaction for this TxnID ─── */
     //
     //   A TxnID is supposed to be globally unique (it's a wallet transaction id),
