@@ -12,9 +12,12 @@ router.post('/login', ctrl.login);
 router.get('/merchants', requireAdmin, ctrl.listMerchants);
 router.get('/merchants/:id', requireAdmin, ctrl.getMerchant);
 router.post('/merchants', requireAdmin, ctrl.createMerchant);
-router.post('/merchants/:id/suspend',   requireAdmin, ctrl.suspendMerchant);
-router.post('/merchants/:id/unsuspend', requireAdmin, ctrl.unsuspendMerchant);
-router.post('/merchants/:id/wallet',    requireAdmin, ctrl.adjustWallet);
+router.post('/merchants/:id/suspend',        requireAdmin, ctrl.suspendMerchant);
+router.post('/merchants/:id/unsuspend',      requireAdmin, ctrl.unsuspendMerchant);
+router.post('/merchants/:id/wallet',         requireAdmin, ctrl.adjustWallet);
+router.get ('/merchants/:id/wallet/ledger',  requireAdmin, ctrl.getMerchantLedger);
+router.get ('/merchants/:id/wallet/recharges', requireAdmin, ctrl.getMerchantRecharges);
+router.post('/merchants/:id/reset-password', requireAdmin, ctrl.resetMerchantPassword);
 
 router.get   ('/providers',     requireAdmin, provCtrl.adminList);
 router.post  ('/providers',     requireAdmin, provCtrl.adminCreate);

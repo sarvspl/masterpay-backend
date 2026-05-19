@@ -37,6 +37,47 @@ async function login(req, res, next) {
 
 async function listMerchants(req, res, next) {
   try {
+    const limit  = Math.min(200, Math.max(1, Number(req.query.limit) || 20));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+    const q      = req.query.q ? String(req.query.q).trim().toLowerCase() : null;
+    const filter = ['active', 'suspended'].includes(req.query.filter) ? req.query.filter : 'all';
+
+    const where  = ['m.is_platform = FALSE'];
+    const params = [];
+
+    if (filter === 'active')    where.push('m.is_suspended = FALSE');
+    if (filter === 'suspended') where.push('m.is_suspended = TRUE');
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(
+        LOWER(m.name) LIKE $${params.length} OR
+        LOWER(m.username) LIKE $${params.length} OR
+        LOWER(m.email) LIKE $${params.length} OR
+        LOWER(m.domain) LIKE $${params.length} OR
+        LOWER(m.mobile) LIKE $${params.length}
+      )`);
+    }
+    const whereSql = `WHERE ${where.join(' AND ')}`;
+
+    // Stats (computed across the FILTERED set, not just the current page,
+    // so the stat cards show meaningful totals as the admin filters).
+    const statsR = await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE m.is_suspended = FALSE)::int AS active,
+              COUNT(*) FILTER (WHERE m.is_suspended = TRUE)::int  AS suspended,
+              COALESCE(SUM(m.wallet_balance), 0)::numeric         AS wallet_sum
+         FROM merchants m
+         ${whereSql}`,
+      params
+    );
+    const stats = {
+      total:      statsR.rows[0].total,
+      active:     statsR.rows[0].active,
+      suspended:  statsR.rows[0].suspended,
+      wallet_sum: Number(statsR.rows[0].wallet_sum),
+    };
+
+    const pageParams = [...params, limit, offset];
     const { rows } = await pool.query(
       `SELECT m.id, m.name, m.username, m.mobile, m.email, m.domain, m.industry, m.country, m.state,
               m.currency, m.wallet_balance, m.is_suspended, m.suspended_at, m.suspended_reason, m.created_at,
@@ -46,8 +87,10 @@ async function listMerchants(req, res, next) {
          FROM merchants m
          JOIN merchant_keys k ON k.merchant_id = m.id
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
-        WHERE m.is_platform = FALSE
-        ORDER BY m.created_at DESC`
+         ${whereSql}
+        ORDER BY m.created_at DESC
+        LIMIT $${pageParams.length - 1} OFFSET $${pageParams.length}`,
+      pageParams
     );
     const merchants = rows.map((r) => ({
       ...r,
@@ -57,7 +100,7 @@ async function listMerchants(req, res, next) {
       default_api_key: undefined,
       device_auth_key: undefined,
     }));
-    res.json({ merchants });
+    res.json({ merchants, total: stats.total, limit, offset, stats });
   } catch (e) {
     next(e);
   }
@@ -328,7 +371,120 @@ async function adjustWallet(req, res, next) {
   }
 }
 
+/* ─── Per-merchant wallet ledger (admin view of merchant.wallet history) ─── */
+async function getMerchantLedger(req, res, next) {
+  try {
+    const limit  = Math.min(200, Math.max(1, Number(req.query.limit)  || 20));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const m = await pool.query(
+      'SELECT id, wallet_balance, currency FROM merchants WHERE id = $1',
+      [req.params.id]
+    );
+    if (m.rowCount === 0) return res.status(404).json({ error: 'Merchant not found' });
+
+    const totalR = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM wallet_ledger WHERE merchant_id = $1',
+      [req.params.id]
+    );
+    const ledgerR = await pool.query(
+      `SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at
+         FROM wallet_ledger WHERE merchant_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3`,
+      [req.params.id, limit, offset]
+    );
+
+    res.json({
+      balance:  Number(m.rows[0].wallet_balance),
+      currency: m.rows[0].currency,
+      ledger:   ledgerR.rows,
+      total:    totalR.rows[0].n,
+      limit, offset,
+    });
+  } catch (e) { next(e); }
+}
+
+/* ─── Per-merchant top-up history (recharge sessions) ─── */
+async function getMerchantRecharges(req, res, next) {
+  try {
+    const limit  = Math.min(200, Math.max(1, Number(req.query.limit)  || 20));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const totalR = await pool.query(
+      `SELECT COUNT(*)::int AS n
+         FROM payment_sessions s
+        WHERE s.metadata->>'type' = 'wallet_topup'
+          AND s.metadata->>'recharge_for_merchant_id' = $1::text`,
+      [req.params.id]
+    );
+    const r = await pool.query(
+      `SELECT s.id AS session_id, s.amount, s.currency, s.status AS session_status,
+              s.created_at, s.expires_at,
+              t.id AS transaction_id, t.txnid_submitted, t.status AS tx_status,
+              t.result_source, t.verified_at, t.failure_reason,
+              g.provider, g.variant, g.account_number, g.label AS gateway_label
+         FROM payment_sessions s
+         LEFT JOIN LATERAL (
+           SELECT id, txnid_submitted, status, result_source, verified_at, failure_reason, gateway_id
+             FROM transactions
+            WHERE session_id = s.id
+            ORDER BY created_at DESC LIMIT 1
+         ) t ON TRUE
+         LEFT JOIN gateways g ON g.id = t.gateway_id
+        WHERE s.metadata->>'type' = 'wallet_topup'
+          AND s.metadata->>'recharge_for_merchant_id' = $1::text
+        ORDER BY s.created_at DESC
+        LIMIT $2 OFFSET $3`,
+      [req.params.id, limit, offset]
+    );
+    res.json({ recharges: r.rows, total: totalR.rows[0].n, limit, offset });
+  } catch (e) { next(e); }
+}
+
+/* ─── Reset a merchant's password ───
+ *   POST /admin/merchants/:id/reset-password
+ *   body: { new_password?: string }
+ *   - If new_password provided, it must be ≥ 6 chars.
+ *   - If absent, server generates a 12-char random one.
+ *   - Returns the plaintext ONCE; admin must copy it now (we don't store
+ *     plaintext anywhere recoverable afterwards).
+ */
+async function resetMerchantPassword(req, res, next) {
+  try {
+    let supplied = req.body && req.body.new_password ? String(req.body.new_password) : null;
+    const generated = !supplied;
+
+    if (supplied != null && supplied.length < 6) {
+      return res.status(400).json({ error: 'new_password must be at least 6 characters' });
+    }
+    if (!supplied) {
+      // 12 char random: uppercase + lowercase + digit so it satisfies usual policies.
+      const alpha = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'; // no 0/O/1/l for readability
+      supplied = '';
+      for (let i = 0; i < 12; i++) supplied += alpha[Math.floor(Math.random() * alpha.length)];
+    }
+
+    const hash = await bcrypt.hash(supplied, 10);
+    const r = await pool.query(
+      `UPDATE merchants SET password_hash = $1, updated_at = NOW()
+        WHERE id = $2 AND is_platform = FALSE
+        RETURNING id, username, email`,
+      [hash, req.params.id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Merchant not found' });
+
+    res.json({
+      ok: true,
+      password: supplied,           // shown ONCE, never stored
+      generated,                    // tells the UI whether to label it "generated" vs "set"
+      merchant: r.rows[0],
+    });
+  } catch (e) { next(e); }
+}
+
 module.exports = {
   login, listMerchants, getMerchant, createMerchant,
   suspendMerchant, unsuspendMerchant, adjustWallet,
+  getMerchantLedger, getMerchantRecharges, resetMerchantPassword,
 };
