@@ -8,8 +8,9 @@ const provCtrl     = require('../controllers/provider.controller');
 const supportCtrl  = require('../controllers/support.controller');
 const platformCtrl = require('../controllers/platform.controller');
 const ticketsCtrl  = require('../controllers/tickets.controller');
+const { limiters } = require('../middleware/rateLimit');
 
-router.post('/login', ctrl.login);
+router.post('/login', limiters.login, ctrl.login);
 router.get('/merchants', requireAdmin, ctrl.listMerchants);
 router.get('/merchants/:id', requireAdmin, ctrl.getMerchant);
 router.post('/merchants', requireAdmin, ctrl.createMerchant);

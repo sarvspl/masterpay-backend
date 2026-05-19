@@ -184,34 +184,53 @@ async function debitVerifyFee(merchantId, transactionId, sessionId, client = nul
   const settings = await getPlatformSettings();
   if (!settings.verify_charge_enabled || Number(settings.verify_charge_amount) <= 0) return null;
 
-  const runner = client || pool;
-
-  // Skip platform merchant + wallet topup sessions + current-balance check.
-  const guard = await runner.query(
-    `SELECT m.is_platform, m.wallet_balance,
-            (SELECT (metadata->>'type') FROM payment_sessions WHERE id = $2) AS sess_kind
-       FROM merchants m WHERE m.id = $1`,
-    [merchantId, sessionId || null]
-  );
-  if (guard.rowCount === 0) return null;
-  if (guard.rows[0].is_platform) return null;
-  if (guard.rows[0].sess_kind === 'wallet_topup') return null;
-
   const fee = Number(settings.verify_charge_amount);
-  const currentBalance = Number(guard.rows[0].wallet_balance);
-  if (currentBalance < fee) {
-    // Defensive — every upstream chargeable path should have rejected the
-    // success flip already. If we get here it's a bug somewhere; refuse to
-    // push negative rather than silently going into debt.
-    console.warn(
-      `[wallet] debit refused — merchant ${merchantId} balance ${currentBalance} < fee ${fee} (tx ${transactionId})`
-    );
-    return null;
-  }
+
+  // CONCURRENCY: Two near-simultaneous successful verifications for the same
+  // merchant must not both pass the balance check when balance == fee × 2 − ε.
+  // We solve this by doing the read + write inside a single transaction with
+  // SELECT ... FOR UPDATE on the merchant row. The lock is released on
+  // COMMIT/ROLLBACK; the second concurrent debit blocks until the first
+  // commits, then reads the decremented balance and correctly rejects if
+  // insufficient.
   const ownsClient = !client;
   const c = client || await pool.connect();
   try {
     if (ownsClient) await c.query('BEGIN');
+
+    // Lock the merchant row + read what we need atomically. The sub-select
+    // for sess_kind is read-only and doesn't need locking.
+    const guard = await c.query(
+      `SELECT m.is_platform, m.wallet_balance,
+              (SELECT (metadata->>'type') FROM payment_sessions WHERE id = $2) AS sess_kind
+         FROM merchants m
+        WHERE m.id = $1
+        FOR UPDATE`,
+      [merchantId, sessionId || null]
+    );
+    if (guard.rowCount === 0) {
+      if (ownsClient) await c.query('ROLLBACK');
+      return null;
+    }
+    if (guard.rows[0].is_platform) {
+      if (ownsClient) await c.query('ROLLBACK');
+      return null;
+    }
+    if (guard.rows[0].sess_kind === 'wallet_topup') {
+      if (ownsClient) await c.query('ROLLBACK');
+      return null;
+    }
+
+    const currentBalance = Number(guard.rows[0].wallet_balance);
+    if (currentBalance < fee) {
+      // Either we got here through a race with another debit, or an upstream
+      // guard let a chargeable success slip through. Refuse to go negative.
+      console.warn(
+        `[wallet] debit refused — merchant ${merchantId} balance ${currentBalance} < fee ${fee} (tx ${transactionId})`
+      );
+      if (ownsClient) await c.query('ROLLBACK');
+      return null;
+    }
 
     // Negative amount = debit; positive = credit. Ledger is the source of truth.
     let ledger = null;

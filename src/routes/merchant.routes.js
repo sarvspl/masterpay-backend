@@ -7,11 +7,12 @@ const smsCtrl = require('../controllers/sms.controller');
 const walletCtrl = require('../controllers/wallet.controller');
 const ticketsCtrl = require('../controllers/tickets.controller');
 const { requireMerchant } = require('../middleware/auth');
+const { limiters } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
 router.post('/register', ctrl.register);
-router.post('/login', ctrl.login);
+router.post('/login', limiters.login, ctrl.login);
 router.get('/check-username', ctrl.checkUsername);
 router.get('/me', requireMerchant, ctrl.me);
 router.patch('/me', requireMerchant, ctrl.updateMe);
@@ -35,7 +36,7 @@ router.get   ('/transactions',                requireMerchant, paymentCtrl.listT
 router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manualResolve);
 
 router.get   ('/sms',        requireMerchant, smsCtrl.listForMerchant);
-router.post  ('/verify',     requireMerchant, smsCtrl.verifyTxnIdManually);
+router.post  ('/verify',     limiters.merchantVerify, requireMerchant, smsCtrl.verifyTxnIdManually);
 
 router.get   ('/wallet',            requireMerchant, walletCtrl.getWallet);
 router.get   ('/wallet/recharges',  requireMerchant, walletCtrl.listRecharges);

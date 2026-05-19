@@ -2,6 +2,7 @@ const express = require('express');
 const ctrl = require('../controllers/device.controller');
 const smsCtrl = require('../controllers/sms.controller');
 const { guardDevice } = require('../middleware/walletGuard');
+const { limiters } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ router.post('/unbind',       ctrl.unbind);
 router.post('/heartbeat',    guardDevice, ctrl.heartbeat);
 router.post('/poll',         guardDevice, ctrl.poll);
 router.post('/report',       guardDevice, ctrl.report);
-router.post('/sms',          guardDevice, smsCtrl.upload);
+router.post('/sms',          limiters.deviceSms, guardDevice, smsCtrl.upload);
 router.post('/transactions', guardDevice, ctrl.listTransactionsForDevice);
 router.post('/verify',       guardDevice, ctrl.verifyTxnIdFromDevice);
 
