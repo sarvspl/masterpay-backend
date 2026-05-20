@@ -23,7 +23,8 @@ function computeFee(base, value, type) {
   return v; // 'flat' or anything else
 }
 
-const SESSION_TTL_MIN = 30;
+const SESSION_TTL_MIN = 24 * 60; // 24 hours — keeps a pending session live so
+                                 // the integrator can keep polling/updating status.
 
 /* ───────────────────────────── MERCHANT-FACING (X-API-Key) */
 

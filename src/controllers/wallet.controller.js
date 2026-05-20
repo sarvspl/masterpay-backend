@@ -11,7 +11,7 @@ const { getPlatformSettings, computeTopupFee } = require('../services/wallet');
 
 const TOPUP_MIN = 10;
 const TOPUP_MAX = 100_000;
-const SESSION_TTL_MIN = 30;
+const SESSION_TTL_MIN = 24 * 60; // 24 hours (matches checkout session lifetime)
 
 /* ── GET /api/merchant/wallet — balance + recent ledger entries ── */
 async function getWallet(req, res, next) {
