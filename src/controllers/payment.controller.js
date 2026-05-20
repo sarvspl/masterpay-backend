@@ -248,6 +248,15 @@ async function submitTxn(req, res, next) {
     if (!gateway_id) return res.status(400).json({ error: 'gateway_id is required' });
     if (!txnid)      return res.status(400).json({ error: 'Transaction ID is required' });
 
+    // Required payment proof: the sender's number + a screenshot of the
+    // confirmation. Presence is validated here (fail fast); the screenshot file
+    // is only written once we know we'll create/link a transaction (below).
+    const sender_account = String(req.body.sender_account || '').trim();
+    const proof_image    = typeof req.body.proof_image === 'string' ? req.body.proof_image : '';
+    if (!sender_account) return res.status(400).json({ error: 'Sender number is required' });
+    if (!/^[0-9+\-\s]{4,40}$/.test(sender_account)) return res.status(400).json({ error: 'Enter a valid sender mobile/account number' });
+    if (!proof_image)    return res.status(400).json({ error: 'Payment screenshot is required' });
+
     // Validate gateway belongs to this merchant
     const g = await pool.query(
       `SELECT id, provider, variant, account_number, label
@@ -321,6 +330,16 @@ async function submitTxn(req, res, next) {
       }
     }
 
+    // All early-exit checks passed — we will create or link a transaction now,
+    // so persist the screenshot to disk. Doing it here (not earlier) avoids
+    // orphan files when the request bailed out above.
+    let proof_image_url = null;
+    try {
+      proof_image_url = require('../services/proof').saveProofImage(proof_image);
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
+
     /* ─── (A) Claim an inbound success that arrived from SMS already ─── */
     //
     //   tryCreateInbound() may have already created a success row with
@@ -340,10 +359,11 @@ async function submitTxn(req, res, next) {
       if (Number(inbound.rows[0].amount) === computeGatewayTotal(s.amount, gateway)) {
         const upd = await pool.query(
           `UPDATE transactions
-              SET session_id = $1, brand_id = $2, customer_phone = COALESCE(customer_phone, $3), updated_at = NOW()
+              SET session_id = $1, brand_id = $2, customer_phone = COALESCE(customer_phone, $3),
+                  sender_account = $5, proof_image_url = $6, updated_at = NOW()
             WHERE id = $4
             RETURNING id, status, created_at`,
-          [s.id, s.brand_id, s.customer_phone, inbound.rows[0].id]
+          [s.id, s.brand_id, s.customer_phone, inbound.rows[0].id, sender_account, proof_image_url]
         );
         await pool.query(
           `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
@@ -390,11 +410,12 @@ async function submitTxn(req, res, next) {
       const ins = await pool.query(
         `INSERT INTO transactions
            (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
-            status, result_source, matched_sms, verified_at, payer_name, payer_phone)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10)
+            status, result_source, matched_sms, verified_at, payer_name, payer_phone,
+            sender_account, proof_image_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10,$11,$12)
          RETURNING id, status, created_at`,
         [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, total, s.customer_phone,
-         sms.body, payer.name, payer.phone]
+         sms.body, payer.name, payer.phone, sender_account, proof_image_url]
       );
       await pool.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [ins.rows[0].id, sms.id]);
       await pool.query(
@@ -413,10 +434,12 @@ async function submitTxn(req, res, next) {
     const totalD = computeGatewayTotal(s.amount, gateway);
     const r = await pool.query(
       `INSERT INTO transactions
-         (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+         (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
+          sender_account, proof_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING id, status, created_at`,
-      [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, totalD, s.customer_phone]
+      [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, totalD, s.customer_phone,
+       sender_account, proof_image_url]
     );
 
     // Fire-and-forget — never block the customer's response on push delivery
@@ -574,7 +597,7 @@ async function listTransactions(req, res, next) {
     const params = [req.merchant.id];
     let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
                       t.result_source, t.verified_at, t.failure_reason, t.created_at,
-                      t.payer_name, t.payer_phone,
+                      t.payer_name, t.payer_phone, t.sender_account, t.proof_image_url,
                       g.provider, g.variant, g.account_number, g.label AS gateway_label,
                       s.order_id, s.currency AS session_currency, s.redirect_url,
                       b.name AS brand_name, b.domain AS brand_domain

@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { startProofCleanupJob, PROOF_DIR } = require('./services/proof');
 
 const merchantRoutes = require('./routes/merchant.routes');
 const adminRoutes = require('./routes/admin.routes');
@@ -14,7 +15,22 @@ const { notFound, errorHandler } = require('./middleware/error');
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+
+// Body parsing: keep the global limit tight at 1 MB, but allow the checkout
+// submit endpoint up to 8 MB so it can carry a base64 payment screenshot.
+// (The client downscales screenshots first, so real payloads are ~200 KB.)
+const stdJson = express.json({ limit: '1mb' });
+const bigJson = express.json({ limit: '8mb' });
+app.use((req, res, next) => {
+  if (req.method === 'POST' && /^\/api\/checkout\/[^/]+\/submit$/.test(req.path)) {
+    return bigJson(req, res, next);
+  }
+  return stdJson(req, res, next);
+});
+
+// Serve uploaded payment-proof screenshots. Filenames are random UUIDs, so the
+// URLs are unguessable; they're auto-purged after 30 days.
+app.use('/uploads/proofs', express.static(PROOF_DIR, { fallthrough: false, maxAge: '7d' }));
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'payverify-backend' }));
 
@@ -33,4 +49,5 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`PayVerify backend listening on http://localhost:${PORT}`);
+  startProofCleanupJob(); // purge payment screenshots older than 30 days
 });
