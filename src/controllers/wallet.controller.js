@@ -7,6 +7,7 @@
 const pool = require('../db/pool');
 const { generateSessionId } = require('../utils/session');
 const { getPlatformMerchantId } = require('./platform.controller');
+const { getPlatformSettings, computeTopupFee } = require('../services/wallet');
 
 const TOPUP_MIN = 10;
 const TOPUP_MAX = 100_000;
@@ -30,10 +31,16 @@ async function getWallet(req, res, next) {
       [req.merchant.id]
     );
 
+    // Expose the top-up fee rate so the dashboard can show a live "you pay"
+    // breakdown before the merchant commits to a recharge.
+    const settings = await getPlatformSettings().catch(() => null);
+
     res.json({
       balance:  Number(balanceR.rows[0].wallet_balance),
       currency: balanceR.rows[0].currency,
       ledger:   ledgerR.rows,
+      topup_fee_enabled: !!(settings && settings.topup_fee_enabled),
+      topup_fee_percent: Number(settings && settings.topup_fee_percent || 0),
     });
   } catch (e) { next(e); }
 }
@@ -109,6 +116,13 @@ async function startRecharge(req, res, next) {
     const currency = meR.rows[0]?.currency || 'BDT';
     const merchantName = meR.rows[0]?.name || 'Merchant';
 
+    // `amount` is what the merchant wants CREDITED. The top-up fee is added on
+    // top, so the gross they actually pay (and what the gateway SMS will show)
+    // is credit + fee. We credit the net on success; the fee is platform income.
+    const settings = await getPlatformSettings().catch(() => null);
+    const fee   = settings ? computeTopupFee(settings, amount) : 0;
+    const gross = Math.round((amount + fee) * 100) / 100;
+
     const id = generateSessionId();
     const expiresAt = new Date(Date.now() + SESSION_TTL_MIN * 60 * 1000);
     const orderId = 'WALLET-' + req.merchant.id + '-' + Date.now().toString(36).toUpperCase();
@@ -120,10 +134,16 @@ async function startRecharge(req, res, next) {
           customer_phone, customer_name, redirect_url, metadata, expires_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [
-        id, platformId, brandR.rows[0].brand_id, orderId, amount, currency,
+        id, platformId, brandR.rows[0].brand_id, orderId, gross, currency,
         null, merchantName,
         `${baseUrl}/dashboard/wallet?topup=ok`,
-        { type: 'wallet_topup', recharge_for_merchant_id: req.merchant.id },
+        {
+          type: 'wallet_topup',
+          recharge_for_merchant_id: req.merchant.id,
+          topup_credit_amount: amount,
+          topup_fee: fee,
+          topup_fee_percent: settings ? Number(settings.topup_fee_percent || 0) : 0,
+        },
         expiresAt,
       ]
     );
@@ -132,7 +152,9 @@ async function startRecharge(req, res, next) {
       session_id:   id,
       checkout_url: `${baseUrl}/pay/${id}`,
       expires_at:   expiresAt.toISOString(),
-      amount,
+      amount,        // credited
+      fee,           // added on top
+      total: gross,  // what they pay
       currency,
     });
   } catch (e) { next(e); }

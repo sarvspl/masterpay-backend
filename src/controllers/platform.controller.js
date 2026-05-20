@@ -42,7 +42,7 @@ async function getInfo(req, res, next) {
   try {
     const id = await getPlatformMerchantId();
     const r = await pool.query(
-      `SELECT m.id, m.name, m.wallet_balance, m.created_at,
+      `SELECT m.id, m.name, m.wallet_balance, m.currency, m.created_at,
               k.device_auth_key,
               b.id AS brand_id, b.api_key, b.domain AS brand_domain
          FROM merchants m
@@ -107,18 +107,27 @@ const SETTINGS_FIELDS = [
   'verify_charge_currency',
   'verify_charge_enabled',
   'low_balance_threshold',
+  'verify_charge_type',
+  'verify_charge_percent',
+  'topup_fee_enabled',
+  'topup_fee_percent',
 ];
+
+const SETTINGS_COLUMNS =
+  `verify_charge_amount, verify_charge_currency, verify_charge_enabled,
+   low_balance_threshold, verify_charge_type, verify_charge_percent,
+   topup_fee_enabled, topup_fee_percent, updated_at`;
 
 async function getSettings(req, res, next) {
   try {
     const r = await pool.query(
-      `SELECT verify_charge_amount, verify_charge_currency, verify_charge_enabled,
-              low_balance_threshold, updated_at
-         FROM platform_settings WHERE id = 1`
+      `SELECT ${SETTINGS_COLUMNS} FROM platform_settings WHERE id = 1`
     );
     res.json({ settings: r.rows[0] || {
       verify_charge_amount: 0, verify_charge_currency: 'BDT',
       verify_charge_enabled: false, low_balance_threshold: 0,
+      verify_charge_type: 'fixed', verify_charge_percent: 0,
+      topup_fee_enabled: false, topup_fee_percent: 0,
     } });
   } catch (e) { next(e); }
 }
@@ -147,7 +156,23 @@ async function updateSettings(req, res, next) {
       if (!/^[A-Z]{3}$/.test(c)) return res.status(400).json({ error: 'verify_charge_currency must be a 3-letter ISO code' });
       patch.verify_charge_currency = c;
     }
+    if ('verify_charge_type' in patch) {
+      const t = String(patch.verify_charge_type || '').trim().toLowerCase();
+      if (t !== 'fixed' && t !== 'percent') return res.status(400).json({ error: "verify_charge_type must be 'fixed' or 'percent'" });
+      patch.verify_charge_type = t;
+    }
+    if ('verify_charge_percent' in patch) {
+      const n = Number(patch.verify_charge_percent);
+      if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'verify_charge_percent must be between 0 and 100' });
+      patch.verify_charge_percent = n;
+    }
     if ('verify_charge_enabled' in patch) patch.verify_charge_enabled = !!patch.verify_charge_enabled;
+    if ('topup_fee_enabled' in patch) patch.topup_fee_enabled = !!patch.topup_fee_enabled;
+    if ('topup_fee_percent' in patch) {
+      const n = Number(patch.topup_fee_percent);
+      if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'topup_fee_percent must be between 0 and 100' });
+      patch.topup_fee_percent = n;
+    }
 
     if (Object.keys(patch).length === 0) {
       return getSettings(req, res, next);
@@ -162,12 +187,57 @@ async function updateSettings(req, res, next) {
     sets.push('updated_at = NOW()');
 
     const sql = `UPDATE platform_settings SET ${sets.join(', ')} WHERE id = 1
-                 RETURNING verify_charge_amount, verify_charge_currency, verify_charge_enabled,
-                          low_balance_threshold, updated_at`;
+                 RETURNING ${SETTINGS_COLUMNS}`;
     const r = await pool.query(sql, params);
     // Bust the wallet service's settings cache so the change takes effect now.
     try { require('../services/wallet').invalidatePlatformSettingsCache(); } catch {}
     res.json({ settings: r.rows[0] });
+  } catch (e) { next(e); }
+}
+
+/* ─── Platform revenue / earnings — super-admin income view ─── */
+async function getRevenue(req, res, next) {
+  try {
+    const limit = Math.min(200, Number(req.query.limit) || 50);
+
+    // Totals by source + grand total, plus simple time windows.
+    const totals = await pool.query(
+      `SELECT
+         COALESCE(SUM(amount), 0)                                                   AS total,
+         COALESCE(SUM(amount) FILTER (WHERE type = 'verify_fee'), 0)                AS verify_fee_total,
+         COALESCE(SUM(amount) FILTER (WHERE type = 'topup_fee'), 0)                 AS topup_fee_total,
+         COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('day', NOW())), 0)   AS today,
+         COALESCE(SUM(amount) FILTER (WHERE created_at >= date_trunc('month', NOW())), 0) AS this_month,
+         COUNT(*)::int                                                              AS entry_count
+       FROM platform_revenue`
+    );
+
+    // Currency: revenue rows carry their own, but the platform's configured
+    // verify-charge currency is the canonical display currency.
+    const cur = await pool.query(
+      `SELECT verify_charge_currency FROM platform_settings WHERE id = 1`
+    );
+
+    const recent = await pool.query(
+      `SELECT r.id, r.type, r.amount, r.currency, r.note, r.created_at,
+              m.name AS merchant_name, m.username AS merchant_username
+         FROM platform_revenue r
+         LEFT JOIN merchants m ON m.id = r.merchant_id
+        ORDER BY r.created_at DESC
+        LIMIT ${limit}`
+    );
+
+    const t = totals.rows[0];
+    res.json({
+      currency: cur.rows[0]?.verify_charge_currency || 'BDT',
+      total:            Number(t.total),
+      verify_fee_total: Number(t.verify_fee_total),
+      topup_fee_total:  Number(t.topup_fee_total),
+      today:            Number(t.today),
+      this_month:       Number(t.this_month),
+      entry_count:      t.entry_count,
+      recent:           recent.rows,
+    });
   } catch (e) { next(e); }
 }
 
@@ -178,6 +248,7 @@ module.exports = {
   listRecharges,
   getSettings,
   updateSettings,
+  getRevenue,
   // The proxied handlers (the same merchant-facing handlers, just with req.merchant injected)
   listGateways:    asPlatformMerchant(gatewayCtrl.list),
   createGateway:   asPlatformMerchant(gatewayCtrl.create),

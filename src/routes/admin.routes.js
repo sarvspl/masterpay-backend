@@ -34,6 +34,7 @@ router.get('/platform',                       requireAdmin, platformCtrl.getInfo
 router.get('/platform/settings',              requireAdmin, platformCtrl.getSettings);
 router.put('/platform/settings',              requireAdmin, platformCtrl.updateSettings);
 router.get('/platform/recharges',             requireAdmin, platformCtrl.listRecharges);
+router.get('/platform/revenue',               requireAdmin, platformCtrl.getRevenue);
 router.get('/platform/gateways',              requireAdmin, platformCtrl.listGateways);
 router.post('/platform/gateways',             requireAdmin, platformCtrl.createGateway);
 router.patch('/platform/gateways/:id',        requireAdmin, platformCtrl.updateGateway);
