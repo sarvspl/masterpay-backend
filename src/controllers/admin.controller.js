@@ -387,10 +387,20 @@ async function getMerchantLedger(req, res, next) {
       'SELECT COUNT(*)::int AS n FROM wallet_ledger WHERE merchant_id = $1',
       [req.params.id]
     );
+    // `balance_after` = running wallet balance immediately after each entry.
+    // Cumulative sum from the OLDEST entry (the wallet starts at 0 and every
+    // balance change writes a ledger row, so the final cumulative equals the
+    // merchant's current wallet_balance). The window runs over the full ledger,
+    // so the figure stays correct on any paginated slice.
     const ledgerR = await pool.query(
-      `SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at
-         FROM wallet_ledger WHERE merchant_id = $1
-        ORDER BY created_at DESC
+      `SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at, balance_after
+         FROM (
+           SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at,
+                  SUM(amount) OVER (ORDER BY created_at ASC, id ASC) AS balance_after
+             FROM wallet_ledger
+            WHERE merchant_id = $1
+         ) x
+        ORDER BY created_at DESC, id DESC
         LIMIT $2 OFFSET $3`,
       [req.params.id, limit, offset]
     );
