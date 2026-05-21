@@ -22,6 +22,19 @@ async function bind(req, res, next) {
     if (!auth_key)  return res.status(400).json({ error: 'auth_key is required' });
     if (!device_id) return res.status(400).json({ error: 'device_id is required' });
 
+    // Binder identity — required. Telegram handle is normalized (drop @ and any
+    // t.me/ prefix) and validated against Telegram's username rules so the
+    // dashboard can safely link to https://t.me/<handle>.
+    const binder_name = String(req.body.binder_name || req.body.name || '').trim();
+    let telegram = String(req.body.telegram || req.body.telegram_handle || '').trim();
+    telegram = telegram.replace(/^https?:\/\/(t\.me|telegram\.me)\//i, '').replace(/^@/, '').trim();
+    if (binder_name.length < 2) {
+      return res.status(400).json({ error: 'binder_name is required (min 2 characters)' });
+    }
+    if (!/^[a-zA-Z0-9_]{4,32}$/.test(telegram)) {
+      return res.status(400).json({ error: 'A valid Telegram username is required (4–32 letters, digits or underscore, e.g. rahim_pay)' });
+    }
+
     const { model, manufacturer, os_version, device_token } = req.body;
 
     // Resolve merchant from auth key
@@ -41,16 +54,18 @@ async function bind(req, res, next) {
     // or restarting the APK doesn't pile up past-device rows.
     const resurrect = await pool.query(
       `UPDATE devices
-          SET unbound_at     = NULL,
-              unbound_reason = NULL,
-              model          = COALESCE($3, model),
-              manufacturer   = COALESCE($4, manufacturer),
-              os_version     = COALESCE($5, os_version),
-              device_token   = COALESCE($6, device_token),
-              last_seen_at   = NOW()
+          SET unbound_at      = NULL,
+              unbound_reason  = NULL,
+              model           = COALESCE($3, model),
+              manufacturer    = COALESCE($4, manufacturer),
+              os_version      = COALESCE($5, os_version),
+              device_token    = COALESCE($6, device_token),
+              binder_name     = $7,
+              telegram_handle = $8,
+              last_seen_at    = NOW()
         WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NOT NULL
         RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
-      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null]
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram]
     );
     if (resurrect.rowCount > 0) {
       return res.json({ ok: true, merchant_name: merchant.name, device: resurrect.rows[0], resurrected: true });
@@ -58,16 +73,18 @@ async function bind(req, res, next) {
 
     // Otherwise upsert against the active-row partial unique index.
     const r = await pool.query(
-      `INSERT INTO devices (merchant_id, device_id, model, manufacturer, os_version, device_token, last_seen_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      `INSERT INTO devices (merchant_id, device_id, model, manufacturer, os_version, device_token, binder_name, telegram_handle, last_seen_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        ON CONFLICT (merchant_id, device_id) WHERE unbound_at IS NULL DO UPDATE
-         SET model        = COALESCE(EXCLUDED.model,        devices.model),
-             manufacturer = COALESCE(EXCLUDED.manufacturer, devices.manufacturer),
-             os_version   = COALESCE(EXCLUDED.os_version,   devices.os_version),
-             device_token = COALESCE(EXCLUDED.device_token, devices.device_token),
-             last_seen_at = NOW()
+         SET model           = COALESCE(EXCLUDED.model,        devices.model),
+             manufacturer    = COALESCE(EXCLUDED.manufacturer, devices.manufacturer),
+             os_version      = COALESCE(EXCLUDED.os_version,   devices.os_version),
+             device_token    = COALESCE(EXCLUDED.device_token, devices.device_token),
+             binder_name     = EXCLUDED.binder_name,
+             telegram_handle = EXCLUDED.telegram_handle,
+             last_seen_at    = NOW()
        RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
-      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null]
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram]
     );
 
     res.json({ ok: true, merchant_name: merchant.name, device: r.rows[0] });
@@ -150,7 +167,7 @@ async function listForMerchant(req, res, next) {
   try {
     const { rows } = await pool.query(
       `SELECT id, device_id, model, manufacturer, os_version, is_enabled,
-              last_seen_at, created_at,
+              last_seen_at, created_at, binder_name, telegram_handle,
               (last_seen_at IS NOT NULL AND last_seen_at > NOW() - INTERVAL '10 minutes') AS is_online
          FROM devices
         WHERE merchant_id = $1 AND unbound_at IS NULL
