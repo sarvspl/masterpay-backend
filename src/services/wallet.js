@@ -122,14 +122,14 @@ async function getPlatformSettings() {
     `SELECT verify_charge_amount, verify_charge_currency,
             verify_charge_enabled, low_balance_threshold,
             verify_charge_type, verify_charge_percent,
-            topup_fee_enabled, topup_fee_percent
+            topup_fee_enabled, topup_fee_percent, key_unlock_fee
        FROM platform_settings WHERE id = 1`
   );
   _settingsCache = r.rows[0] || {
     verify_charge_amount: 0, verify_charge_currency: 'BDT',
     verify_charge_enabled: false, low_balance_threshold: 0,
     verify_charge_type: 'fixed', verify_charge_percent: 0,
-    topup_fee_enabled: false, topup_fee_percent: 0,
+    topup_fee_enabled: false, topup_fee_percent: 0, key_unlock_fee: 0,
   };
   _settingsCacheAt = now;
   return _settingsCache;

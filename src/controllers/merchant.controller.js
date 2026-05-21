@@ -8,6 +8,7 @@ const {
 } = require('../utils/keys');
 const { generateUniqueUsername, slugify } = require('../utils/username');
 const { currencyForCountry } = require('../utils/currency');
+const { getPlatformSettings, recordPlatformRevenue } = require('../services/wallet');
 
 const USERNAME_RE = /^[a-z0-9_]{3,40}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -89,9 +90,20 @@ async function register(req, res, next) {
       await client.query('COMMIT');
 
       const token = sign({ sub: merchant.id, username: merchant.username, role: 'merchant' });
+      // Keys start locked behind the one-time unlock fee — don't leak them in
+      // the signup response. The dashboard prompts to unlock + pay.
+      const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
+      const fee = Number(settings.key_unlock_fee || 0);
+      const unlocked = fee <= 0;
       res.status(201).json({
         token,
-        merchant: { ...merchant, api_key: apiKey, device_auth_key: deviceAuthKey },
+        merchant: {
+          ...merchant,
+          keys_unlocked: unlocked,
+          key_unlock_fee: fee,
+          api_key: unlocked ? apiKey : null,
+          device_auth_key: unlocked ? deviceAuthKey : null,
+        },
       });
     } catch (e) {
       await client.query('ROLLBACK');
@@ -144,7 +156,7 @@ async function me(req, res, next) {
   try {
     const { rows } = await pool.query(
       `SELECT m.id, m.name, m.username, m.mobile, m.email, m.domain, m.industry, m.country, m.state,
-              m.currency, m.wallet_balance, m.created_at,
+              m.currency, m.wallet_balance, m.created_at, m.keys_unlocked,
               k.device_auth_key,
               b.api_key, b.id AS default_brand_id
          FROM merchants m
@@ -154,7 +166,21 @@ async function me(req, res, next) {
       [req.merchant.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Merchant not found' });
-    res.json({ merchant: rows[0] });
+
+    // Gate the integration keys behind the one-time unlock purchase. Until the
+    // fee is paid, the keys are NOT returned at all (so they can't be read off
+    // the network). The frontend shows a purchase prompt instead.
+    const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
+    const fee = Number(settings.key_unlock_fee || 0);
+    const m = rows[0];
+    m.key_unlock_fee = fee;
+    // fee<=0 means the gate is disabled — keys are effectively always unlocked.
+    m.keys_unlocked = m.keys_unlocked || fee <= 0;
+    if (!m.keys_unlocked) {
+      m.api_key = null;
+      m.device_auth_key = null;
+    }
+    res.json({ merchant: m });
   } catch (e) {
     next(e);
   }
@@ -242,10 +268,24 @@ async function listBrands(req, res, next) {
         ORDER BY is_default DESC, created_at ASC`,
       [req.merchant.id]
     );
-    res.json({ brands: rows });
+
+    // Mask brand keys until the one-time unlock fee is paid.
+    const unlocked = await keysUnlocked(req.merchant.id);
+    const brands = unlocked ? rows : rows.map((b) => ({ ...b, api_key: null, secret_key: null }));
+    res.json({ brands, keys_unlocked: unlocked });
   } catch (e) {
     next(e);
   }
+}
+
+// True when this merchant may see its integration keys — either it already
+// paid the unlock fee, or the fee is disabled (0).
+async function keysUnlocked(merchantId) {
+  const r = await pool.query('SELECT keys_unlocked FROM merchants WHERE id = $1', [merchantId]);
+  if (r.rowCount === 0) return false;
+  if (r.rows[0].keys_unlocked) return true;
+  const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
+  return Number(settings.key_unlock_fee || 0) <= 0;
 }
 
 async function createBrand(req, res, next) {
@@ -298,7 +338,85 @@ async function deleteBrand(req, res, next) {
   }
 }
 
+/* ─── One-time integration-key unlock (paid from wallet) ─── */
+async function unlockKeys(req, res, next) {
+  const client = await pool.connect();
+  try {
+    const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0, verify_charge_currency: 'BDT' }));
+    const fee = Number(settings.key_unlock_fee || 0);
+
+    await client.query('BEGIN');
+    const m = await client.query(
+      `SELECT m.id, m.wallet_balance, m.keys_unlocked, m.currency,
+              k.device_auth_key, b.api_key
+         FROM merchants m
+         JOIN merchant_keys k ON k.merchant_id = m.id
+         LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
+        WHERE m.id = $1
+        FOR UPDATE OF m`,
+      [req.merchant.id]
+    );
+    if (m.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Merchant not found' }); }
+    const row = m.rows[0];
+
+    // Already unlocked, or the gate is disabled (fee 0) → just return the keys.
+    if (row.keys_unlocked || fee <= 0) {
+      if (!row.keys_unlocked) {
+        await client.query('UPDATE merchants SET keys_unlocked = TRUE WHERE id = $1', [req.merchant.id]);
+      }
+      await client.query('COMMIT');
+      return res.json({ keys_unlocked: true, api_key: row.api_key, device_auth_key: row.device_auth_key });
+    }
+
+    const balance = Number(row.wallet_balance);
+    if (balance < fee) {
+      await client.query('ROLLBACK');
+      return res.status(402).json({
+        error: 'Insufficient wallet balance to unlock your integration keys.',
+        code: 'insufficient_balance',
+        balance, fee,
+      });
+    }
+
+    // Debit the fee, flip the flag, log the ledger entry + platform revenue —
+    // all atomically. The FOR UPDATE lock + keys_unlocked flag prevent any
+    // double-charge from concurrent/repeat calls.
+    await client.query(
+      `UPDATE merchants
+          SET wallet_balance = wallet_balance - $1, keys_unlocked = TRUE, updated_at = NOW()
+        WHERE id = $2`,
+      [fee, req.merchant.id]
+    );
+    await client.query(
+      `INSERT INTO wallet_ledger (merchant_id, amount, kind, note)
+       VALUES ($1, $2, 'key_unlock', 'Integration key unlock')`,
+      [req.merchant.id, -fee]
+    );
+    await recordPlatformRevenue(client, {
+      type: 'key_unlock',
+      amount: fee,
+      currency: settings.verify_charge_currency || row.currency || 'BDT',
+      merchantId: req.merchant.id,
+      note: 'Integration key unlock',
+    });
+    await client.query('COMMIT');
+
+    res.json({
+      keys_unlocked: true,
+      api_key: row.api_key,
+      device_auth_key: row.device_auth_key,
+      balance: balance - fee,
+      fee,
+    });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   register, login, me, updateMe, changePassword, checkUsername,
-  listBrands, createBrand, deleteBrand,
+  listBrands, createBrand, deleteBrand, unlockKeys,
 };

@@ -111,12 +111,13 @@ const SETTINGS_FIELDS = [
   'verify_charge_percent',
   'topup_fee_enabled',
   'topup_fee_percent',
+  'key_unlock_fee',
 ];
 
 const SETTINGS_COLUMNS =
   `verify_charge_amount, verify_charge_currency, verify_charge_enabled,
    low_balance_threshold, verify_charge_type, verify_charge_percent,
-   topup_fee_enabled, topup_fee_percent, updated_at`;
+   topup_fee_enabled, topup_fee_percent, key_unlock_fee, updated_at`;
 
 async function getSettings(req, res, next) {
   try {
@@ -127,7 +128,7 @@ async function getSettings(req, res, next) {
       verify_charge_amount: 0, verify_charge_currency: 'BDT',
       verify_charge_enabled: false, low_balance_threshold: 0,
       verify_charge_type: 'fixed', verify_charge_percent: 0,
-      topup_fee_enabled: false, topup_fee_percent: 0,
+      topup_fee_enabled: false, topup_fee_percent: 0, key_unlock_fee: 0,
     } });
   } catch (e) { next(e); }
 }
@@ -172,6 +173,11 @@ async function updateSettings(req, res, next) {
       const n = Number(patch.topup_fee_percent);
       if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'topup_fee_percent must be between 0 and 100' });
       patch.topup_fee_percent = n;
+    }
+    if ('key_unlock_fee' in patch) {
+      const n = Number(patch.key_unlock_fee);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'key_unlock_fee must be a non-negative number' });
+      patch.key_unlock_fee = n;
     }
 
     if (Object.keys(patch).length === 0) {
