@@ -135,7 +135,29 @@ async function getSessionForMerchant(req, res, next) {
                  FROM transactions
                  WHERE session_id = s.id AND status = 'success'
                  ORDER BY verified_at DESC NULLS LAST LIMIT 1
-              ) t) AS successful_transaction
+              ) t) AS successful_transaction,
+              -- Latest transaction of ANY status, with the details a merchant
+              -- server needs to verify a payment: UTR, payment method, and the
+              -- customer's sender account.
+              (SELECT row_to_json(lt) FROM (
+                 SELECT t.id,
+                        t.txnid_submitted,
+                        g.provider AS method,
+                        g.variant,
+                        g.account_number,
+                        t.sender_account,
+                        t.amount,
+                        t.status,
+                        t.result_source,
+                        t.failure_reason,
+                        t.verified_at,
+                        t.created_at
+                   FROM transactions t
+                   LEFT JOIN gateways g ON g.id = t.gateway_id
+                  WHERE t.session_id = s.id
+                  ORDER BY t.created_at DESC
+                  LIMIT 1
+              ) lt) AS latest_transaction
          FROM payment_sessions s
         WHERE s.id = $1 AND s.merchant_id = $2`,
       [req.params.id, req.brand.merchant_id]
