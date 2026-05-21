@@ -620,7 +620,7 @@ async function listTransactions(req, res, next) {
     const params = [req.merchant.id];
     let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
                       t.result_source, t.verified_at, t.failure_reason, t.created_at,
-                      t.payer_name, t.payer_phone, t.sender_account, t.proof_image_url,
+                      t.payer_name, t.payer_phone, t.sender_account, t.proof_image_url, t.matched_sms,
                       g.provider, g.variant, g.account_number, g.label AS gateway_label,
                       s.order_id, s.currency AS session_currency, s.redirect_url,
                       b.name AS brand_name, b.domain AS brand_domain
