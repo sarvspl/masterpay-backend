@@ -146,14 +146,15 @@ async function create(req, res, next) {
     const providerErr = await validateProviderVariant(provider, variant);
     if (providerErr) return res.status(400).json({ error: providerErr });
 
-    // Gateways belong to a specific account. Verify ownership + unlock state.
-    const account_id = String(req.body.account_id || '').trim();
-    if (!account_id) return res.status(400).json({ error: 'account_id is required', field: 'account_id' });
-    const acc = await pool.query(
-      'SELECT id, keys_unlocked FROM accounts WHERE id = $1 AND merchant_id = $2',
-      [account_id, req.merchant.id]
-    );
+    // Gateways belong to a specific account. When account_id is omitted (e.g.
+    // the platform-merchant admin console, which has a single account), fall
+    // back to the merchant's Primary account.
+    let account_id = String(req.body.account_id || '').trim();
+    const acc = account_id
+      ? await pool.query('SELECT id, keys_unlocked FROM accounts WHERE id = $1 AND merchant_id = $2', [account_id, req.merchant.id])
+      : await pool.query('SELECT id, keys_unlocked FROM accounts WHERE merchant_id = $1 AND is_default = TRUE', [req.merchant.id]);
     if (acc.rowCount === 0) return res.status(404).json({ error: 'Account not found' });
+    account_id = acc.rows[0].id;
     if (!(await accountCanAddGateways(acc.rows[0]))) {
       return res.status(403).json({ error: 'Unlock this account before adding gateways.', code: 'account_locked' });
     }

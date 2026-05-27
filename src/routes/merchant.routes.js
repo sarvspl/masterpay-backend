@@ -27,6 +27,7 @@ router.delete('/brands/:id', requireMerchant, ctrl.deleteBrand);
 router.get   ('/accounts',            requireMerchant, accountsCtrl.list);
 router.post  ('/accounts',            requireMerchant, accountsCtrl.create);
 router.post  ('/accounts/:id/unlock', requireMerchant, accountsCtrl.unlock);
+router.delete('/accounts/:id',        requireMerchant, accountsCtrl.remove);
 
 router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
 router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);

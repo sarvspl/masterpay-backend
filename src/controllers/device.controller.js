@@ -37,6 +37,20 @@ async function bind(req, res, next) {
       return res.status(400).json({ error: 'A valid Telegram username is required (4–32 letters, digits or underscore, e.g. rahim_pay)' });
     }
 
+    // WhatsApp number — optional. Normalize to digits (keep a leading +), so the
+    // dashboard can link to https://wa.me/<number>. Reject obviously bad input.
+    let whatsapp = String(req.body.whatsapp || '').trim();
+    whatsapp = whatsapp.replace(/^https?:\/\/(wa\.me|api\.whatsapp\.com)\//i, '').replace(/[\s\-()]/g, '');
+    if (whatsapp) {
+      const normalized = whatsapp.replace(/^\+/, '');
+      if (!/^\d{7,15}$/.test(normalized)) {
+        return res.status(400).json({ error: 'WhatsApp number looks invalid — use 7–15 digits (optionally with country code).' });
+      }
+      whatsapp = normalized;
+    } else {
+      whatsapp = null;
+    }
+
     const { model, manufacturer, os_version, device_token } = req.body;
 
     // Resolve merchant + account from the auth key (each account has its own key).
@@ -67,10 +81,11 @@ async function bind(req, res, next) {
               device_token    = COALESCE($6, device_token),
               binder_name     = $7,
               telegram_handle = $8,
+              whatsapp        = $10,
               last_seen_at    = NOW()
         WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NOT NULL
         RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
-      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram, accountId]
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram, accountId, whatsapp]
     );
     if (resurrect.rowCount > 0) {
       return res.json({ ok: true, merchant_name: merchant.name, device: resurrect.rows[0], resurrected: true });
@@ -78,8 +93,8 @@ async function bind(req, res, next) {
 
     // Otherwise upsert against the active-row partial unique index.
     const r = await pool.query(
-      `INSERT INTO devices (merchant_id, account_id, device_id, model, manufacturer, os_version, device_token, binder_name, telegram_handle, last_seen_at)
-       VALUES ($1, $9, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `INSERT INTO devices (merchant_id, account_id, device_id, model, manufacturer, os_version, device_token, binder_name, telegram_handle, whatsapp, last_seen_at)
+       VALUES ($1, $9, $2, $3, $4, $5, $6, $7, $8, $10, NOW())
        ON CONFLICT (merchant_id, device_id) WHERE unbound_at IS NULL DO UPDATE
          SET account_id      = EXCLUDED.account_id,
              model           = COALESCE(EXCLUDED.model,        devices.model),
@@ -88,9 +103,10 @@ async function bind(req, res, next) {
              device_token    = COALESCE(EXCLUDED.device_token, devices.device_token),
              binder_name     = EXCLUDED.binder_name,
              telegram_handle = EXCLUDED.telegram_handle,
+             whatsapp        = EXCLUDED.whatsapp,
              last_seen_at    = NOW()
        RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
-      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram, accountId]
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram, accountId, whatsapp]
     );
 
     res.json({ ok: true, merchant_name: merchant.name, device: r.rows[0] });
@@ -169,12 +185,14 @@ async function heartbeat(req, res, next) {
 async function listForMerchant(req, res, next) {
   try {
     const { rows } = await pool.query(
-      `SELECT id, device_id, model, manufacturer, os_version, is_enabled,
-              last_seen_at, created_at, binder_name, telegram_handle,
-              (last_seen_at IS NOT NULL AND last_seen_at > NOW() - INTERVAL '10 minutes') AS is_online
-         FROM devices
-        WHERE merchant_id = $1 AND unbound_at IS NULL
-        ORDER BY created_at DESC`,
+      `SELECT d.id, d.device_id, d.model, d.manufacturer, d.os_version, d.is_enabled,
+              d.last_seen_at, d.created_at, d.binder_name, d.telegram_handle, d.whatsapp,
+              d.account_id, a.label AS account_label, a.is_default AS account_is_default,
+              (d.last_seen_at IS NOT NULL AND d.last_seen_at > NOW() - INTERVAL '10 minutes') AS is_online
+         FROM devices d
+         LEFT JOIN accounts a ON a.id = d.account_id
+        WHERE d.merchant_id = $1 AND d.unbound_at IS NULL
+        ORDER BY d.created_at DESC`,
       [req.merchant.id]
     );
     const past = await pool.query(

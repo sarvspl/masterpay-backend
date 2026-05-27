@@ -197,4 +197,23 @@ async function unlock(req, res, next) {
   }
 }
 
-module.exports = { list, create, unlock, extraAccountFee };
+/* ─── DELETE /api/merchant/accounts/:id ───
+ * Remove a non-primary account. Its gateways + devices cascade away. The
+ * paid unlock fee is not refunded.
+ */
+async function remove(req, res, next) {
+  try {
+    const r = await pool.query(
+      `DELETE FROM accounts
+        WHERE id = $1 AND merchant_id = $2 AND is_default = FALSE
+        RETURNING id`,
+      [req.params.id, req.merchant.id]
+    );
+    if (r.rowCount === 0) {
+      return res.status(400).json({ error: 'Cannot delete this account. It either does not exist or is the primary account.' });
+    }
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+}
+
+module.exports = { list, create, unlock, remove, extraAccountFee };

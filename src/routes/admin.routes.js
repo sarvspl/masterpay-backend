@@ -21,6 +21,8 @@ router.get ('/merchants/:id/wallet/ledger',  requireAdmin, ctrl.getMerchantLedge
 router.get ('/merchants/:id/wallet/recharges', requireAdmin, ctrl.getMerchantRecharges);
 router.post('/merchants/:id/reset-password', requireAdmin, ctrl.resetMerchantPassword);
 
+router.patch('/devices/:id', requireAdmin, ctrl.updateDevice);
+
 router.get   ('/providers',     requireAdmin, provCtrl.adminList);
 router.post  ('/providers',     requireAdmin, provCtrl.adminCreate);
 router.patch ('/providers/:id', requireAdmin, provCtrl.adminUpdate);
