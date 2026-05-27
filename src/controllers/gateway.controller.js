@@ -1,5 +1,14 @@
 const pool = require('../db/pool');
 const { extractTxnId, extractAmount, findGatewayInSms, extractPayer, extractDirection } = require('./sms.controller');
+const { getPlatformSettings } = require('../services/wallet');
+
+// An account may add gateways once its device key is unlocked — or always, if
+// the key-unlock gate is disabled platform-wide (fee 0).
+async function accountCanAddGateways(account) {
+  if (account.keys_unlocked) return true;
+  const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
+  return Number(settings.key_unlock_fee || 0) <= 0;
+}
 
 const CHARGE_TYPES = ['fixed', 'percent'];
 
@@ -106,15 +115,22 @@ async function rescanUnmatchedSms(merchantId, gateway) {
 
 async function list(req, res, next) {
   try {
+    // Optional ?account_id= filter; otherwise all of the merchant's gateways
+    // (each row carries account_id so the dashboard can group by account).
+    const accountId = req.query.account_id ? String(req.query.account_id) : null;
+    const params = [req.merchant.id];
+    let where = 'merchant_id = $1';
+    if (accountId) { params.push(accountId); where += ` AND account_id = $${params.length}`; }
+
     const { rows } = await pool.query(
-      `SELECT id, provider, variant, account_number, label,
+      `SELECT id, account_id, provider, variant, account_number, label,
               min_amount, max_amount, charge_value, charge_type,
               discount_value, discount_type, balance_check, is_enabled,
               created_at, updated_at
          FROM gateways
-        WHERE merchant_id = $1
+        WHERE ${where}
         ORDER BY created_at ASC`,
-      [req.merchant.id]
+      params
     );
     res.json({ gateways: rows });
   } catch (e) { next(e); }
@@ -130,17 +146,29 @@ async function create(req, res, next) {
     const providerErr = await validateProviderVariant(provider, variant);
     if (providerErr) return res.status(400).json({ error: providerErr });
 
+    // Gateways belong to a specific account. Verify ownership + unlock state.
+    const account_id = String(req.body.account_id || '').trim();
+    if (!account_id) return res.status(400).json({ error: 'account_id is required', field: 'account_id' });
+    const acc = await pool.query(
+      'SELECT id, keys_unlocked FROM accounts WHERE id = $1 AND merchant_id = $2',
+      [account_id, req.merchant.id]
+    );
+    if (acc.rowCount === 0) return res.status(404).json({ error: 'Account not found' });
+    if (!(await accountCanAddGateways(acc.rows[0]))) {
+      return res.status(403).json({ error: 'Unlock this account before adding gateways.', code: 'account_locked' });
+    }
+
     const account_number = String(req.body.account_number).trim();
 
     const r = await pool.query(
       `INSERT INTO gateways (
-         merchant_id, provider, variant, account_number, label,
+         merchant_id, account_id, provider, variant, account_number, label,
          min_amount, max_amount, charge_value, charge_type,
          discount_value, discount_type, balance_check
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
-        req.merchant.id, provider, variant, account_number,
+        req.merchant.id, account_id, provider, variant, account_number,
         req.body.label || null,
         toNum(req.body.min_amount), toNum(req.body.max_amount),
         toNum(req.body.charge_value), req.body.charge_type || null,
@@ -153,7 +181,8 @@ async function create(req, res, next) {
     res.status(201).json({ gateway, retroactively_matched: 0 });
   } catch (e) {
     if (e.code === '23505') {
-      return res.status(409).json({ error: 'A gateway with this account number already exists for this provider/variant.' });
+      // The (account_id, provider, variant) unique index — one of each pair per account.
+      return res.status(409).json({ error: 'This account already has a gateway for this provider and type. Each account allows one per provider+variant.' });
     }
     next(e);
   }

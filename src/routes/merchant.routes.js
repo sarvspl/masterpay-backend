@@ -1,5 +1,6 @@
 const express = require('express');
 const ctrl = require('../controllers/merchant.controller');
+const accountsCtrl = require('../controllers/accounts.controller');
 const deviceCtrl = require('../controllers/device.controller');
 const gatewayCtrl = require('../controllers/gateway.controller');
 const paymentCtrl = require('../controllers/payment.controller');
@@ -22,6 +23,10 @@ router.post('/me/password', requireMerchant, ctrl.changePassword);
 router.get   ('/brands',     requireMerchant, ctrl.listBrands);
 router.post  ('/brands',     requireMerchant, ctrl.createBrand);
 router.delete('/brands/:id', requireMerchant, ctrl.deleteBrand);
+
+router.get   ('/accounts',            requireMerchant, accountsCtrl.list);
+router.post  ('/accounts',            requireMerchant, accountsCtrl.create);
+router.post  ('/accounts/:id/unlock', requireMerchant, accountsCtrl.unlock);
 
 router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
 router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);

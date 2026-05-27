@@ -87,6 +87,14 @@ async function register(req, res, next) {
         [merchant.id, name, domain, apiKey, secretKey]
       );
 
+      // Primary account — the domain account. Carries the device auth key and
+      // its gateways. Starts locked behind the same one-time unlock fee.
+      await client.query(
+        `INSERT INTO accounts (merchant_id, label, device_auth_key, keys_unlocked, is_default)
+         VALUES ($1, 'Primary', $2, FALSE, TRUE)`,
+        [merchant.id, deviceAuthKey]
+      );
+
       await client.query('COMMIT');
 
       const token = sign({ sub: merchant.id, username: merchant.username, role: 'merchant' });
@@ -154,13 +162,15 @@ async function login(req, res, next) {
 
 async function me(req, res, next) {
   try {
+    // The device auth key + its unlock state now live on the Primary account.
     const { rows } = await pool.query(
       `SELECT m.id, m.name, m.username, m.mobile, m.email, m.domain, m.industry, m.country, m.state,
-              m.currency, m.wallet_balance, m.created_at, m.keys_unlocked,
-              k.device_auth_key,
+              m.currency, m.wallet_balance, m.created_at,
+              (m.keys_unlocked OR COALESCE(a.keys_unlocked, FALSE)) AS keys_unlocked,
+              a.device_auth_key,
               b.api_key, b.id AS default_brand_id
          FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
+         LEFT JOIN accounts a ON a.merchant_id = m.id AND a.is_default = TRUE
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
         WHERE m.id = $1`,
       [req.merchant.id]
@@ -348,9 +358,9 @@ async function unlockKeys(req, res, next) {
     await client.query('BEGIN');
     const m = await client.query(
       `SELECT m.id, m.wallet_balance, m.keys_unlocked, m.currency,
-              k.device_auth_key, b.api_key
+              a.id AS account_id, a.device_auth_key, b.api_key
          FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
+         LEFT JOIN accounts a ON a.merchant_id = m.id AND a.is_default = TRUE
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
         WHERE m.id = $1
         FOR UPDATE OF m`,
@@ -363,6 +373,7 @@ async function unlockKeys(req, res, next) {
     if (row.keys_unlocked || fee <= 0) {
       if (!row.keys_unlocked) {
         await client.query('UPDATE merchants SET keys_unlocked = TRUE WHERE id = $1', [req.merchant.id]);
+        await client.query('UPDATE accounts SET keys_unlocked = TRUE WHERE merchant_id = $1 AND is_default = TRUE', [req.merchant.id]);
       }
       await client.query('COMMIT');
       return res.json({ keys_unlocked: true, api_key: row.api_key, device_auth_key: row.device_auth_key });
@@ -387,6 +398,7 @@ async function unlockKeys(req, res, next) {
         WHERE id = $2`,
       [fee, req.merchant.id]
     );
+    await client.query('UPDATE accounts SET keys_unlocked = TRUE WHERE merchant_id = $1 AND is_default = TRUE', [req.merchant.id]);
     await client.query(
       `INSERT INTO wallet_ledger (merchant_id, amount, kind, note)
        VALUES ($1, $2, 'key_unlock', 'Integration key unlock')`,

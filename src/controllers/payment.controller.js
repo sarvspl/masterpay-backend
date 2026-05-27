@@ -209,12 +209,28 @@ async function listCheckoutGateways(req, res, next) {
     const s = await loadSession(req.params.id);
     if (!s) return res.status(404).json({ error: 'Session not found' });
 
+    // Round-robin: a merchant may hold the same provider+variant number on
+    // several accounts (one per account). Show ONE number per provider+variant,
+    // picking the least-recently-shown (last_shown_at ASC), then stamp NOW() so
+    // the next checkout rotates to the other(s). Pick + stamp in one statement
+    // so they stay atomic.
     const r = await pool.query(
-      `SELECT id, provider, variant, account_number, label, min_amount, max_amount,
-              charge_value, charge_type, discount_value, discount_type
-         FROM gateways
-        WHERE merchant_id = $1 AND is_enabled = TRUE
-        ORDER BY provider ASC, variant ASC`,
+      `WITH picked AS (
+         SELECT DISTINCT ON (provider, variant) id
+           FROM gateways
+          WHERE merchant_id = $1 AND is_enabled = TRUE
+          ORDER BY provider, variant, last_shown_at ASC NULLS FIRST, id
+       ),
+       bumped AS (
+         UPDATE gateways g
+            SET last_shown_at = NOW()
+           FROM picked p
+          WHERE g.id = p.id
+        RETURNING g.id, g.provider, g.variant, g.account_number, g.label,
+                  g.min_amount, g.max_amount, g.charge_value, g.charge_type,
+                  g.discount_value, g.discount_type
+       )
+       SELECT * FROM bumped ORDER BY provider ASC, variant ASC`,
       [s.merchant_id]
     );
     res.json({ gateways: r.rows });

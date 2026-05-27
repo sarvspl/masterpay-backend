@@ -278,12 +278,12 @@ async function upload(req, res, next) {
     if (messages.length === 0) return res.status(400).json({ error: 'messages array is empty' });
     if (messages.length > 100)  return res.status(400).json({ error: 'Too many messages in one upload (max 100)' });
 
-    // Resolve merchant
+    // Resolve merchant + account from the device auth key
     const m = await pool.query(
-      `SELECT m.id, m.is_suspended
-         FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
-        WHERE k.device_auth_key = $1`,
+      `SELECT m.id, m.is_suspended, a.id AS account_id
+         FROM accounts a
+         JOIN merchants m ON m.id = a.merchant_id
+        WHERE a.device_auth_key = $1`,
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
@@ -291,11 +291,12 @@ async function upload(req, res, next) {
       return res.status(403).json({ error: 'Merchant account is suspended', suspended: true });
     }
     const merchantId = m.rows[0].id;
+    const accountId = m.rows[0].account_id;
 
-    // Touch device last_seen
+    // Touch device last_seen (scoped to this account's bound device)
     await pool.query(
-      `UPDATE devices SET last_seen_at = NOW() WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
-      [merchantId, device_id]
+      `UPDATE devices SET last_seen_at = NOW() WHERE account_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
+      [accountId, device_id]
     );
 
     const stored = [];

@@ -61,8 +61,8 @@ async function guardDevice(req, res, next) {
 
     const r = await pool.query(
       `SELECT m.id FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
-        WHERE k.device_auth_key = $1`,
+         JOIN accounts a ON a.merchant_id = m.id
+        WHERE a.device_auth_key = $1`,
       [auth_key]
     );
     if (r.rowCount === 0) return next(); // handler will return 401

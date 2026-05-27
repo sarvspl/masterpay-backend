@@ -206,6 +206,14 @@ async function createMerchant(req, res, next) {
          VALUES ($1, $2, $3, $4, $5, TRUE)`,
         [merchant.id, name, domain, apiKey, secretKey]
       );
+      // Primary (domain) account — carries the device auth key + its gateways.
+      // Unlock state mirrors merchants.keys_unlocked (default FALSE) so the
+      // existing one-time-unlock gate is preserved for admin-created merchants.
+      await client.query(
+        `INSERT INTO accounts (merchant_id, label, device_auth_key, keys_unlocked, is_default)
+         VALUES ($1, 'Primary', $2, FALSE, TRUE)`,
+        [merchant.id, deviceAuthKey]
+      );
       await client.query('COMMIT');
 
       res.status(201).json({

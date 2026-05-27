@@ -1,13 +1,15 @@
 const pool = require('../db/pool');
 const { verifyTxnIdForMerchant } = require('./sms.controller');
 
-/* Internal: resolve merchant_id from device auth_key. Returns merchant_id or null. */
+/* Internal: resolve merchant + account from a device auth_key. Each account
+ * has its own key now, so this also yields the account_id the phone belongs to.
+ * Returns { merchant_id, account_id, is_suspended } or null. */
 async function resolveMerchantFromAuthKey(auth_key) {
   const m = await pool.query(
-    `SELECT m.id AS merchant_id, m.is_suspended
-       FROM merchants m
-       JOIN merchant_keys k ON k.merchant_id = m.id
-      WHERE k.device_auth_key = $1`,
+    `SELECT m.id AS merchant_id, a.id AS account_id, m.is_suspended
+       FROM accounts a
+       JOIN merchants m ON m.id = a.merchant_id
+      WHERE a.device_auth_key = $1`,
     [auth_key]
   );
   if (m.rowCount === 0) return null;
@@ -37,25 +39,28 @@ async function bind(req, res, next) {
 
     const { model, manufacturer, os_version, device_token } = req.body;
 
-    // Resolve merchant from auth key
+    // Resolve merchant + account from the auth key (each account has its own key).
     const m = await pool.query(
-      `SELECT m.id, m.name, m.is_suspended, m.suspended_reason
-         FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
-        WHERE k.device_auth_key = $1`,
+      `SELECT m.id, m.name, m.is_suspended, m.suspended_reason, a.id AS account_id
+         FROM accounts a
+         JOIN merchants m ON m.id = a.merchant_id
+        WHERE a.device_auth_key = $1`,
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
     if (m.rows[0].is_suspended) return res.status(403).json({ error: 'Merchant account is suspended', suspended: true });
     const merchant = m.rows[0];
+    const accountId = merchant.account_id;
 
     // First: if an UNBOUND row exists for the same merchant+device_id, resurrect it
-    // (clear unbound_at, refresh metadata). This keeps history clean — re-installing
-    // or restarting the APK doesn't pile up past-device rows.
+    // (clear unbound_at, refresh metadata, re-point to the binding account). This
+    // keeps history clean — re-installing or restarting the APK doesn't pile up
+    // past-device rows.
     const resurrect = await pool.query(
       `UPDATE devices
           SET unbound_at      = NULL,
               unbound_reason  = NULL,
+              account_id      = $9,
               model           = COALESCE($3, model),
               manufacturer    = COALESCE($4, manufacturer),
               os_version      = COALESCE($5, os_version),
@@ -65,7 +70,7 @@ async function bind(req, res, next) {
               last_seen_at    = NOW()
         WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NOT NULL
         RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
-      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram]
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram, accountId]
     );
     if (resurrect.rowCount > 0) {
       return res.json({ ok: true, merchant_name: merchant.name, device: resurrect.rows[0], resurrected: true });
@@ -73,10 +78,11 @@ async function bind(req, res, next) {
 
     // Otherwise upsert against the active-row partial unique index.
     const r = await pool.query(
-      `INSERT INTO devices (merchant_id, device_id, model, manufacturer, os_version, device_token, binder_name, telegram_handle, last_seen_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `INSERT INTO devices (merchant_id, account_id, device_id, model, manufacturer, os_version, device_token, binder_name, telegram_handle, last_seen_at)
+       VALUES ($1, $9, $2, $3, $4, $5, $6, $7, $8, NOW())
        ON CONFLICT (merchant_id, device_id) WHERE unbound_at IS NULL DO UPDATE
-         SET model           = COALESCE(EXCLUDED.model,        devices.model),
+         SET account_id      = EXCLUDED.account_id,
+             model           = COALESCE(EXCLUDED.model,        devices.model),
              manufacturer    = COALESCE(EXCLUDED.manufacturer, devices.manufacturer),
              os_version      = COALESCE(EXCLUDED.os_version,   devices.os_version),
              device_token    = COALESCE(EXCLUDED.device_token, devices.device_token),
@@ -84,7 +90,7 @@ async function bind(req, res, next) {
              telegram_handle = EXCLUDED.telegram_handle,
              last_seen_at    = NOW()
        RETURNING id, device_id, model, manufacturer, last_seen_at, created_at`,
-      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram]
+      [merchant.id, device_id, model || null, manufacturer || null, os_version || null, device_token || null, binder_name, telegram, accountId]
     );
 
     res.json({ ok: true, merchant_name: merchant.name, device: r.rows[0] });
@@ -103,25 +109,22 @@ async function unbind(req, res, next) {
     if (!auth_key)  return res.status(400).json({ error: 'auth_key is required' });
     if (!device_id) return res.status(400).json({ error: 'device_id is required' });
 
-    // Resolve merchant from auth key. Suspended merchants can still unbind
+    // Resolve account from auth key. Suspended merchants can still unbind
     // (lets a phone clean up locally even if account is suspended).
     const m = await pool.query(
-      `SELECT m.id
-         FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
-        WHERE k.device_auth_key = $1`,
+      `SELECT id AS account_id, merchant_id FROM accounts WHERE device_auth_key = $1`,
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
 
-    // Soft-delete: preserve history. Only target the active row.
+    // Soft-delete: preserve history. Only target the active row for THIS account.
     const r = await pool.query(
       `UPDATE devices
           SET unbound_at = NOW(),
               unbound_reason = 'apk_unbind'
-        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL
+        WHERE account_id = $1 AND device_id = $2 AND unbound_at IS NULL
         RETURNING id`,
-      [m.rows[0].id, device_id]
+      [m.rows[0].account_id, device_id]
     );
 
     res.json({
@@ -143,10 +146,10 @@ async function heartbeat(req, res, next) {
     const r = await pool.query(
       `UPDATE devices d
           SET last_seen_at = NOW()
-         FROM merchant_keys k
-        WHERE d.merchant_id = k.merchant_id
+         FROM accounts a
+        WHERE d.account_id = a.id
           AND d.device_id = $1
-          AND k.device_auth_key = $2
+          AND a.device_auth_key = $2
           AND d.unbound_at IS NULL
         RETURNING d.id, d.merchant_id`,
       [device_id, auth_key]
@@ -212,21 +215,24 @@ async function poll(req, res, next) {
     }
 
     const m = await pool.query(
-      `SELECT m.id AS merchant_id
-         FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
-        WHERE k.device_auth_key = $1`,
+      `SELECT m.id AS merchant_id, a.id AS account_id
+         FROM accounts a
+         JOIN merchants m ON m.id = a.merchant_id
+        WHERE a.device_auth_key = $1`,
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
+    const { merchant_id, account_id } = m.rows[0];
 
     // Touch device last_seen (acts as heartbeat too) — only the active row
     await pool.query(
       `UPDATE devices SET last_seen_at = NOW()
-        WHERE merchant_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
-      [m.rows[0].merchant_id, device_id]
+        WHERE account_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
+      [account_id, device_id]
     );
 
+    // Account-scoped: a phone only receives verifications for ITS account's
+    // gateways (that account's bKash number's SMS lands only on this phone).
     const r = await pool.query(
       `SELECT t.id AS verification_id,
               t.txnid_submitted,
@@ -243,16 +249,17 @@ async function poll(req, res, next) {
          JOIN gateways g ON g.id = t.gateway_id
          LEFT JOIN payment_sessions s ON s.id = t.session_id
         WHERE t.merchant_id = $1
+          AND g.account_id = $2
           AND t.status = 'pending'
         ORDER BY t.created_at ASC
         LIMIT 20`,
-      [m.rows[0].merchant_id]
+      [merchant_id, account_id]
     );
 
     // Include the wallet snapshot so the APK balance pill updates from a poll
     // response (no extra round-trip needed).
     const { getWalletStatusForMerchant } = require('../services/wallet');
-    const wallet = await getWalletStatusForMerchant(m.rows[0].merchant_id).catch(() => null);
+    const wallet = await getWalletStatusForMerchant(merchant_id).catch(() => null);
 
     res.json({ verifications: r.rows, ...(wallet || {}) });
   } catch (e) { next(e); }
@@ -276,10 +283,10 @@ async function report(req, res, next) {
     }
 
     const m = await pool.query(
-      `SELECT m.id AS merchant_id
-         FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
-        WHERE k.device_auth_key = $1`,
+      `SELECT m.id AS merchant_id, a.id AS account_id
+         FROM accounts a
+         JOIN merchants m ON m.id = a.merchant_id
+        WHERE a.device_auth_key = $1`,
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
@@ -302,6 +309,7 @@ async function report(req, res, next) {
                 verified_at = NOW(),
                 updated_at = NOW()
           WHERE id = $5 AND merchant_id = $6 AND status = 'pending'
+            AND gateway_id IN (SELECT id FROM gateways WHERE account_id = $7)
           RETURNING id, session_id, status`,
         [
           result, device_id,
@@ -309,7 +317,7 @@ async function report(req, res, next) {
           result === 'success'
             ? note                                   // optional manual note on approve
             : (note || 'No matching SMS'),           // note (or fallback) on reject
-          verification_id, m.rows[0].merchant_id,
+          verification_id, m.rows[0].merchant_id, m.rows[0].account_id,
         ]
       );
       if (upd.rowCount === 0) {
