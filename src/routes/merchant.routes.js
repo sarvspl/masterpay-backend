@@ -31,6 +31,7 @@ router.delete('/accounts/:id',        requireMerchant, accountsCtrl.remove);
 
 router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
 router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);
+router.patch ('/devices/:id',     requireMerchant, deviceCtrl.updateForMerchant);
 router.delete('/devices/:id',     requireMerchant, deviceCtrl.deleteForMerchant);
 
 router.get   ('/gateways',            requireMerchant, gatewayCtrl.list);

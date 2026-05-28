@@ -458,6 +458,55 @@ async function verifyTxnIdFromDevice(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── Merchant-facing: edit a bound device's contact info ───
+ *   PATCH /api/merchant/devices/:id
+ *   body { binder_name?, telegram_handle? (or telegram), whatsapp? }
+ *   Only supplied fields change. Scoped to the merchant's own active devices.
+ */
+async function updateForMerchant(req, res, next) {
+  try {
+    const fields = {};
+
+    if (req.body.binder_name !== undefined) {
+      const bn = String(req.body.binder_name).trim();
+      if (bn && bn.length < 2) return res.status(400).json({ error: 'Binder name must be at least 2 characters' });
+      fields.binder_name = bn || null;
+    }
+    if (req.body.telegram_handle !== undefined || req.body.telegram !== undefined) {
+      let tg = String(req.body.telegram_handle ?? req.body.telegram ?? '').trim();
+      tg = tg.replace(/^https?:\/\/(t\.me|telegram\.me)\//i, '').replace(/^@/, '').trim();
+      if (tg && !/^[a-zA-Z0-9_]{4,32}$/.test(tg)) {
+        return res.status(400).json({ error: 'Invalid Telegram username (4–32 letters, digits or underscore)' });
+      }
+      fields.telegram_handle = tg || null;
+    }
+    if (req.body.whatsapp !== undefined) {
+      let wa = String(req.body.whatsapp || '').trim()
+        .replace(/^https?:\/\/(wa\.me|api\.whatsapp\.com)\//i, '')
+        .replace(/[\s\-()]/g, '')
+        .replace(/^\+/, '');
+      if (wa && !/^\d{7,15}$/.test(wa)) {
+        return res.status(400).json({ error: 'Invalid WhatsApp number (7–15 digits, optionally with country code)' });
+      }
+      fields.whatsapp = wa || null;
+    }
+
+    const cols = Object.keys(fields); // whitelisted keys only — safe to interpolate
+    if (cols.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+
+    const sets = cols.map((c, i) => `${c} = $${i + 3}`).join(', ');
+    const vals = cols.map((c) => fields[c]);
+    const r = await pool.query(
+      `UPDATE devices SET ${sets}
+        WHERE id = $1 AND merchant_id = $2 AND unbound_at IS NULL
+        RETURNING id, binder_name, telegram_handle, whatsapp`,
+      [req.params.id, req.merchant.id, ...vals]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Device not found' });
+    res.json({ device: r.rows[0] });
+  } catch (e) { next(e); }
+}
+
 /* ─── Merchant-facing: unbind a device (soft-delete, preserves history) ─── */
 async function deleteForMerchant(req, res, next) {
   try {
@@ -477,5 +526,5 @@ async function deleteForMerchant(req, res, next) {
 module.exports = {
   bind, unbind, heartbeat, poll, report,
   listTransactionsForDevice, verifyTxnIdFromDevice,
-  listForMerchant, listHistoryForMerchant, deleteForMerchant,
+  listForMerchant, listHistoryForMerchant, updateForMerchant, deleteForMerchant,
 };
