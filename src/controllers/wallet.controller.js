@@ -22,11 +22,19 @@ async function getWallet(req, res, next) {
     );
     if (balanceR.rowCount === 0) return res.status(404).json({ error: 'Merchant not found' });
 
+    // `balance_after` = running wallet balance immediately after each entry.
+    // Cumulative sum from the oldest entry; the window covers the merchant's
+    // entire ledger so the figure stays correct even though we slice the most
+    // recent 50 for display.
     const ledgerR = await pool.query(
-      `SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at
-         FROM wallet_ledger
-        WHERE merchant_id = $1
-        ORDER BY created_at DESC
+      `SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at, balance_after
+         FROM (
+           SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at,
+                  SUM(amount) OVER (ORDER BY created_at ASC, id ASC) AS balance_after
+             FROM wallet_ledger
+            WHERE merchant_id = $1
+         ) x
+        ORDER BY created_at DESC, id DESC
         LIMIT 50`,
       [req.merchant.id]
     );

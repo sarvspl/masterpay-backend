@@ -15,6 +15,18 @@ const GATEWAY_COLS = `id, provider, variant, account_number, label,
   discount_value, discount_type, balance_check, is_enabled,
   created_at, updated_at`;
 
+// Map a `window` query param to a safe SQL time predicate. Keys are fixed
+// strings, so the resulting clause never contains user-controlled text.
+function windowClause(window, col = 't.created_at') {
+  switch (String(window || '').toLowerCase()) {
+    case 'today':
+    case '1d': return `AND ${col} >= NOW() - INTERVAL '1 day'`;
+    case '7d': return `AND ${col} >= NOW() - INTERVAL '7 days'`;
+    case '30d': return `AND ${col} >= NOW() - INTERVAL '30 days'`;
+    default:   return ''; // lifetime / unrecognized → no filter
+  }
+}
+
 /* ─── GET /api/merchant/accounts ───
  * Accounts + their gateways. The device_auth_key is masked (null) until that
  * account is unlocked. The Primary account follows the merchant-level unlock
@@ -46,8 +58,26 @@ async function list(req, res, next) {
       (gatewaysByAccount[row.account_id] ||= []).push(row);
     }
 
+    // Per-account stats: count + sum of *successful* verifications received via
+    // the account's gateways, scoped to the chosen window.
+    const stats = await pool.query(
+      `SELECT g.account_id,
+              COUNT(*) FILTER (WHERE t.status = 'success')::int                       AS txn_count,
+              COALESCE(SUM(t.amount) FILTER (WHERE t.status = 'success'), 0)::numeric AS txn_total
+         FROM transactions t
+         JOIN gateways g ON g.id = t.gateway_id
+        WHERE t.merchant_id = $1 ${windowClause(req.query.window)}
+        GROUP BY g.account_id`,
+      [req.merchant.id]
+    );
+    const statsByAccount = {};
+    for (const row of stats.rows) {
+      statsByAccount[row.account_id] = { txn_count: row.txn_count, txn_total: Number(row.txn_total) };
+    }
+
     const accounts = a.rows.map((acc) => {
       const unlocked = acc.keys_unlocked || gateDisabled;
+      const s = statsByAccount[acc.id] || { txn_count: 0, txn_total: 0 };
       return {
         id: acc.id,
         label: acc.label,
@@ -56,6 +86,8 @@ async function list(req, res, next) {
         device_auth_key: unlocked ? acc.device_auth_key : null,
         created_at: acc.created_at,
         gateways: gatewaysByAccount[acc.id] || [],
+        txn_count: s.txn_count,
+        txn_total: s.txn_total,
       };
     });
 
@@ -64,6 +96,7 @@ async function list(req, res, next) {
       key_unlock_fee: fullFee,
       extra_account_fee: extraAccountFee(fullFee),
       currency: settings.verify_charge_currency || null,
+      window: String(req.query.window || 'all').toLowerCase(),
     });
   } catch (e) { next(e); }
 }

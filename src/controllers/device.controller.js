@@ -199,7 +199,36 @@ async function listForMerchant(req, res, next) {
       `SELECT COUNT(*)::int AS n FROM devices WHERE merchant_id = $1 AND unbound_at IS NOT NULL`,
       [req.merchant.id]
     );
-    res.json({ devices: rows, past_count: past.rows[0].n });
+
+    // Per-device stats — successful verifications THIS phone resolved
+    // (matched on transactions.result_device_id), scoped to the chosen window.
+    const w = String(req.query.window || '').toLowerCase();
+    const winSql = w === 'today' || w === '1d' ? `AND t.created_at >= NOW() - INTERVAL '1 day'`
+                 : w === '7d'                  ? `AND t.created_at >= NOW() - INTERVAL '7 days'`
+                 : w === '30d'                 ? `AND t.created_at >= NOW() - INTERVAL '30 days'`
+                 : '';
+    const stats = await pool.query(
+      `SELECT t.result_device_id,
+              COUNT(*)::int                       AS txn_count,
+              COALESCE(SUM(t.amount), 0)::numeric AS txn_total
+         FROM transactions t
+        WHERE t.merchant_id = $1
+          AND t.status = 'success'
+          AND t.result_device_id IS NOT NULL
+          ${winSql}
+        GROUP BY t.result_device_id`,
+      [req.merchant.id]
+    );
+    const statsByDevice = {};
+    for (const row of stats.rows) {
+      statsByDevice[row.result_device_id] = { txn_count: row.txn_count, txn_total: Number(row.txn_total) };
+    }
+    const devices = rows.map((d) => {
+      const s = statsByDevice[d.device_id] || { txn_count: 0, txn_total: 0 };
+      return { ...d, txn_count: s.txn_count, txn_total: s.txn_total };
+    });
+
+    res.json({ devices, past_count: past.rows[0].n, window: w || 'all' });
   } catch (e) { next(e); }
 }
 

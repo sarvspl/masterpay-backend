@@ -633,20 +633,29 @@ async function listTransactions(req, res, next) {
     const q = req.query.q ? String(req.query.q).trim() : null;
     const limit = Math.min(200, Number(req.query.limit) || 50);
 
+    const accountId = req.query.account_id ? String(req.query.account_id) : null;
+    const deviceId  = req.query.device_id  ? String(req.query.device_id)  : null;
+
     const params = [req.merchant.id];
     let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
-                      t.result_source, t.verified_at, t.failure_reason, t.created_at,
+                      t.result_source, t.result_device_id, t.verified_at, t.failure_reason, t.created_at,
                       t.payer_name, t.payer_phone, t.sender_account, t.proof_image_url, t.matched_sms,
                       g.provider, g.variant, g.account_number, g.label AS gateway_label,
+                      g.account_id, a.label AS account_label, a.is_default AS account_is_default,
+                      d.id AS device_uuid, d.model AS device_model, d.manufacturer AS device_manufacturer,
                       s.order_id, s.currency AS session_currency, s.redirect_url,
                       b.name AS brand_name, b.domain AS brand_domain
                  FROM transactions t
                  JOIN gateways g ON g.id = t.gateway_id
+                 LEFT JOIN accounts a ON a.id = g.account_id
+                 LEFT JOIN devices  d ON d.merchant_id = t.merchant_id AND d.device_id = t.result_device_id
                  LEFT JOIN payment_sessions s ON s.id = t.session_id
                  LEFT JOIN brands b ON b.id = COALESCE(t.brand_id, s.brand_id)
                 WHERE t.merchant_id = $1`;
-    if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
-    if (q)      { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
+    if (status)    { params.push(status); sql += ` AND t.status = $${params.length}`; }
+    if (q)         { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
+    if (accountId) { params.push(accountId); sql += ` AND g.account_id = $${params.length}`; }
+    if (deviceId)  { params.push(deviceId);  sql += ` AND t.result_device_id = $${params.length}`; }
     sql += ` ORDER BY t.created_at DESC LIMIT ${limit}`;
 
     const r = await pool.query(sql, params);
