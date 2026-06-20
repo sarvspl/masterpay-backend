@@ -70,19 +70,29 @@ async function sendOne(token, data) {
 }
 
 /**
- * Notify every active, bound device of `merchantId` about a new pending
- * verification.  No-op if FCM is not configured.
+ * Notify the active, bound device(s) about a new pending verification.
+ * No-op if FCM is not configured.
+ *
+ * When `accountId` is given, only phones bound to THAT account (vendor) are
+ * pinged — so a payment for one vendor never buzzes another vendor's phone.
+ * When omitted, every device of the merchant is notified (legacy behaviour).
  */
-async function notifyVerifyRequest(merchantId, payload) {
+async function notifyVerifyRequest(merchantId, payload, accountId = null) {
   if (!FCM_KEY) return;     // Push not configured — polling still works.
 
   const { rows } = await pool.query(
-    `SELECT device_token FROM devices
-      WHERE merchant_id = $1
-        AND unbound_at IS NULL
-        AND device_token IS NOT NULL
-        AND device_token <> ''`,
-    [merchantId]
+    accountId
+      ? `SELECT device_token FROM devices
+          WHERE account_id = $1
+            AND unbound_at IS NULL
+            AND device_token IS NOT NULL
+            AND device_token <> ''`
+      : `SELECT device_token FROM devices
+          WHERE merchant_id = $1
+            AND unbound_at IS NULL
+            AND device_token IS NOT NULL
+            AND device_token <> ''`,
+    [accountId || merchantId]
   );
   if (rows.length === 0) return;
 

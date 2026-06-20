@@ -26,6 +26,8 @@ function computeFee(base, value, type) {
 const SESSION_TTL_MIN = 24 * 60; // 24 hours — keeps a pending session live so
                                  // the integrator can keep polling/updating status.
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /* ───────────────────────────── MERCHANT-FACING (X-API-Key) */
 
 /**
@@ -55,6 +57,22 @@ async function createSession(req, res, next) {
     if (order_id.length > 120)                    return res.status(400).json({ error: 'order_id must be at most 120 characters' });
     if (!redirect_url)                            return res.status(400).json({ error: 'redirect_url is required' });
     try { new URL(redirect_url); } catch { return res.status(400).json({ error: 'redirect_url must be a valid URL' }); }
+
+    // Optional vendor scoping: a marketplace passes the vendor_id it got from
+    // POST /api/vendors. When set, the checkout shows only that vendor's
+    // gateways and only that vendor's phone(s) are notified. Omit it → the
+    // session spans the whole merchant (legacy behaviour).
+    let account_id = null;
+    if (req.body.vendor_id != null && String(req.body.vendor_id).trim() !== '') {
+      const vendorId = String(req.body.vendor_id).trim();
+      if (!UUID_RE.test(vendorId)) return res.status(400).json({ error: 'vendor_id is not a valid id' });
+      const v = await pool.query(
+        'SELECT id FROM accounts WHERE id = $1 AND merchant_id = $2',
+        [vendorId, req.brand.merchant_id]
+      );
+      if (v.rowCount === 0) return res.status(400).json({ error: 'Invalid vendor_id for this merchant' });
+      account_id = v.rows[0].id;
+    }
 
     const baseUrl = process.env.PUBLIC_CHECKOUT_BASE_URL || 'http://localhost:3000';
 
@@ -103,9 +121,9 @@ async function createSession(req, res, next) {
 
     await pool.query(
       `INSERT INTO payment_sessions
-         (id, merchant_id, brand_id, order_id, amount, currency, customer_phone, customer_name, redirect_url, metadata, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [id, req.brand.merchant_id, req.brand.brand_id, order_id, amount, currency, customer_phone, customer_name, redirect_url, metadata, expiresAt]
+         (id, merchant_id, brand_id, account_id, order_id, amount, currency, customer_phone, customer_name, redirect_url, metadata, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [id, req.brand.merchant_id, req.brand.brand_id, account_id, order_id, amount, currency, customer_phone, customer_name, redirect_url, metadata, expiresAt]
     );
 
     res.status(201).json({
@@ -173,7 +191,7 @@ async function loadSession(sessionId) {
   const r = await pool.query(
     `SELECT s.id, s.amount, s.currency, s.order_id, s.customer_phone, s.customer_name,
             s.redirect_url, s.status, s.expires_at, s.created_at,
-            s.merchant_id, s.brand_id,
+            s.merchant_id, s.brand_id, s.account_id,
             m.name AS merchant_name,
             b.name AS brand_name, b.domain AS brand_domain
        FROM payment_sessions s
@@ -214,11 +232,17 @@ async function listCheckoutGateways(req, res, next) {
     // picking the least-recently-shown (last_shown_at ASC), then stamp NOW() so
     // the next checkout rotates to the other(s). Pick + stamp in one statement
     // so they stay atomic.
+    //
+    // When the session is vendor-scoped (account_id set), restrict to THAT
+    // vendor's gateways so the customer only ever sees the vendor they're
+    // buying from. Otherwise span the whole merchant (legacy behaviour).
+    const scopeCol = s.account_id ? 'account_id' : 'merchant_id';
+    const scopeVal = s.account_id || s.merchant_id;
     const r = await pool.query(
       `WITH picked AS (
          SELECT DISTINCT ON (provider, variant) id
            FROM gateways
-          WHERE merchant_id = $1 AND is_enabled = TRUE
+          WHERE ${scopeCol} = $1 AND is_enabled = TRUE
           ORDER BY provider, variant, last_shown_at ASC NULLS FIRST, id
        ),
        bumped AS (
@@ -231,7 +255,7 @@ async function listCheckoutGateways(req, res, next) {
                   g.discount_value, g.discount_type
        )
        SELECT * FROM bumped ORDER BY provider ASC, variant ASC`,
-      [s.merchant_id]
+      [scopeVal]
     );
     res.json({ gateways: r.rows });
   } catch (e) { next(e); }
@@ -298,12 +322,19 @@ async function submitTxn(req, res, next) {
 
     // Validate gateway belongs to this merchant
     const g = await pool.query(
-      `SELECT id, provider, variant, account_number, label
+      `SELECT id, provider, variant, account_number, label, account_id
          FROM gateways WHERE id = $1 AND merchant_id = $2 AND is_enabled = TRUE`,
       [gateway_id, s.merchant_id]
     );
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
     const gateway = g.rows[0];
+
+    // Vendor-scoped session: the chosen gateway must belong to the session's
+    // vendor. Guards against a tampered gateway_id routing a payment to (and
+    // notifying) the wrong vendor's phone.
+    if (s.account_id && gateway.account_id !== s.account_id) {
+      return res.status(400).json({ error: 'Invalid gateway for this vendor' });
+    }
 
     /* ─── Session-lock: one Verify per session ─── */
     //
@@ -481,7 +512,10 @@ async function submitTxn(req, res, next) {
        sender_account, proof_image_url]
     );
 
-    // Fire-and-forget — never block the customer's response on push delivery
+    // Fire-and-forget — never block the customer's response on push delivery.
+    // Scope by the gateway's account: only the phone(s) bound to THIS vendor's
+    // account are notified (every gateway has an account_id, so this also keeps
+    // single-account merchants correctly scoped to their one account).
     notifyVerifyRequest(s.merchant_id, {
       verification_id: r.rows[0].id,
       txnid,
@@ -493,7 +527,7 @@ async function submitTxn(req, res, next) {
       customer_name:   s.customer_name,
       order_id:        s.order_id,
       created_at:      r.rows[0].created_at,
-    }).catch((e) => console.warn('[push] notifyVerifyRequest failed:', e.message));
+    }, gateway.account_id).catch((e) => console.warn('[push] notifyVerifyRequest failed:', e.message));
 
     res.status(202).json({ transaction: r.rows[0] });
   } catch (e) { next(e); }

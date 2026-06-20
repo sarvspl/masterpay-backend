@@ -8,6 +8,7 @@ const adminRoutes = require('./routes/admin.routes');
 const deviceRoutes = require('./routes/device.routes');
 const paymentRoutes = require('./routes/payment.routes');
 const checkoutRoutes = require('./routes/checkout.routes');
+const vendorRoutes = require('./routes/vendors.routes');
 const providerRoutes = require('./routes/provider.routes');
 const supportCtrl    = require('./controllers/support.controller');
 const { notFound, errorHandler } = require('./middleware/error');
@@ -38,6 +39,7 @@ app.use('/api/merchant', merchantRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/device', deviceRoutes);
 app.use('/api/payment', paymentRoutes);
+app.use('/api/vendors', vendorRoutes);
 app.use('/api/checkout', checkoutRoutes);
 app.use('/api/providers', providerRoutes);
 
