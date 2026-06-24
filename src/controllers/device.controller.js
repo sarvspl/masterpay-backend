@@ -184,6 +184,14 @@ async function heartbeat(req, res, next) {
 /* ─── Merchant-facing: list bound (active) devices + past-device count ─── */
 async function listForMerchant(req, res, next) {
   try {
+    // Optional ?account_id= filter. The vendor panel forces this so a vendor
+    // only ever sees the phones bound to their own account.
+    const accountId = req.query.account_id ? String(req.query.account_id) : null;
+
+    const listParams = [req.merchant.id];
+    let accountClause = '';
+    if (accountId) { listParams.push(accountId); accountClause = ` AND d.account_id = $${listParams.length}`; }
+
     const { rows } = await pool.query(
       `SELECT d.id, d.device_id, d.model, d.manufacturer, d.os_version, d.is_enabled,
               d.last_seen_at, d.created_at, d.binder_name, d.telegram_handle, d.whatsapp,
@@ -191,13 +199,16 @@ async function listForMerchant(req, res, next) {
               (d.last_seen_at IS NOT NULL AND d.last_seen_at > NOW() - INTERVAL '10 minutes') AS is_online
          FROM devices d
          LEFT JOIN accounts a ON a.id = d.account_id
-        WHERE d.merchant_id = $1 AND d.unbound_at IS NULL
+        WHERE d.merchant_id = $1 AND d.unbound_at IS NULL${accountClause}
         ORDER BY d.created_at DESC`,
-      [req.merchant.id]
+      listParams
     );
+    const pastParams = [req.merchant.id];
+    let pastClause = '';
+    if (accountId) { pastParams.push(accountId); pastClause = ` AND account_id = $${pastParams.length}`; }
     const past = await pool.query(
-      `SELECT COUNT(*)::int AS n FROM devices WHERE merchant_id = $1 AND unbound_at IS NOT NULL`,
-      [req.merchant.id]
+      `SELECT COUNT(*)::int AS n FROM devices WHERE merchant_id = $1 AND unbound_at IS NOT NULL${pastClause}`,
+      pastParams
     );
 
     // Per-device stats — successful verifications THIS phone resolved
