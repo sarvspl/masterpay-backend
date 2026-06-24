@@ -39,7 +39,8 @@ async function list(req, res, next) {
     const gateDisabled = fullFee <= 0;
 
     const a = await pool.query(
-      `SELECT id, label, device_auth_key, keys_unlocked, is_default, created_at
+      `SELECT id, label, device_auth_key, keys_unlocked, is_default, created_at,
+              external_id, username
          FROM accounts
         WHERE merchant_id = $1
         ORDER BY is_default DESC, created_at ASC`,
@@ -78,10 +79,17 @@ async function list(req, res, next) {
     const accounts = a.rows.map((acc) => {
       const unlocked = acc.keys_unlocked || gateDisabled;
       const s = statsByAccount[acc.id] || { txn_count: 0, txn_total: 0 };
+      // A vendor-owned account (provisioned via POST /api/vendors or holding a
+      // vendor login) is managed by the vendor — the operator's dashboard shows
+      // its gateways read-only (pause/enable only). has_vendor_login means the
+      // seller has actually claimed their panel.
+      const is_vendor = !acc.is_default && (acc.external_id != null || acc.username != null);
       return {
         id: acc.id,
         label: acc.label,
         is_default: acc.is_default,
+        is_vendor,
+        has_vendor_login: acc.username != null,
         keys_unlocked: unlocked,
         device_auth_key: unlocked ? acc.device_auth_key : null,
         created_at: acc.created_at,

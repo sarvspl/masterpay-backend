@@ -35,10 +35,10 @@ router.patch ('/devices/:id',     requireMerchant, deviceCtrl.updateForMerchant)
 router.delete('/devices/:id',     requireMerchant, deviceCtrl.deleteForMerchant);
 
 router.get   ('/gateways',            requireMerchant, gatewayCtrl.list);
-router.post  ('/gateways',            requireMerchant, gatewayCtrl.create);
-router.patch ('/gateways/:id',        requireMerchant, gatewayCtrl.update);
-router.post  ('/gateways/:id/toggle', requireMerchant, gatewayCtrl.toggle);
-router.delete('/gateways/:id',        requireMerchant, gatewayCtrl.remove);
+router.post  ('/gateways',            requireMerchant, gatewayCtrl.guardCreateNotVendor, gatewayCtrl.create);
+router.patch ('/gateways/:id',        requireMerchant, gatewayCtrl.guardGatewayNotVendor, gatewayCtrl.update);
+router.post  ('/gateways/:id/toggle', requireMerchant, gatewayCtrl.toggle); // pause/enable allowed on vendor gateways
+router.delete('/gateways/:id',        requireMerchant, gatewayCtrl.guardGatewayNotVendor, gatewayCtrl.remove);
 
 router.get   ('/transactions',                requireMerchant, paymentCtrl.listTransactions);
 router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manualResolve);
