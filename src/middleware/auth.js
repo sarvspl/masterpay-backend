@@ -52,7 +52,8 @@ async function requireVendor(req, res, next) {
     // merchant must not be suspended (a suspended marketplace freezes all its
     // vendors). payload.sub is the account id.
     const r = await pool.query(
-      `SELECT a.id, a.merchant_id, a.username, m.is_suspended, m.suspended_reason
+      `SELECT a.id, a.merchant_id, a.username, a.activated_at,
+              m.is_suspended, m.suspended_reason
          FROM accounts a
          JOIN merchants m ON m.id = a.merchant_id
         WHERE a.id = $1`,
@@ -69,15 +70,40 @@ async function requireVendor(req, res, next) {
         suspended: true,
       });
     }
+    // Activation fee is a single platform-wide amount set by the admin. The
+    // vendor is gated until they've paid it (when it's > 0).
+    let globalFee = 0;
+    try {
+      const s = await require('../services/wallet').getPlatformSettings();
+      globalFee = Number(s.vendor_activation_fee || 0);
+    } catch { globalFee = 0; }
+    const needsActivation = globalFee > 0 && r.rows[0].activated_at == null;
     req.vendor = {
-      account_id:  r.rows[0].id,
-      merchant_id: r.rows[0].merchant_id,
-      username:    r.rows[0].username,
+      account_id:      r.rows[0].id,
+      merchant_id:     r.rows[0].merchant_id,
+      username:        r.rows[0].username,
+      activation_fee:  globalFee,
+      activated_at:    r.rows[0].activated_at,
+      needs_activation: needsActivation,
     };
     next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+}
+
+// Block the vendor's panel data endpoints until they've paid the activation fee.
+// Mount AFTER requireVendor. /me and the activation endpoints stay open so the
+// panel can show the pay screen and accept the payment.
+function requireActivated(req, res, next) {
+  if (req.vendor && req.vendor.needs_activation) {
+    return res.status(403).json({
+      error: 'Activate your account to access this. Pay the one-time activation fee first.',
+      code: 'activation_required',
+      activation_fee: req.vendor.activation_fee,
+    });
+  }
+  next();
 }
 
 function requireAdmin(req, res, next) {
@@ -95,4 +121,4 @@ function requireAdmin(req, res, next) {
   }
 }
 
-module.exports = { requireMerchant, requireVendor, requireAdmin };
+module.exports = { requireMerchant, requireVendor, requireActivated, requireAdmin };

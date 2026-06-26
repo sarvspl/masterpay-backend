@@ -40,12 +40,26 @@ async function list(req, res, next) {
 
     const a = await pool.query(
       `SELECT id, label, device_auth_key, keys_unlocked, is_default, created_at,
-              external_id, username
+              external_id, username, activation_fee, activated_at
          FROM accounts
         WHERE merchant_id = $1
         ORDER BY is_default DESC, created_at ASC`,
       [req.merchant.id]
     );
+
+    // Which vendor accounts have an activation payment awaiting confirmation.
+    // (Activation payments are booked under the platform merchant, so scope by
+    // the vendor account belonging to this merchant, not by transactions.merchant_id.)
+    const pend = await pool.query(
+      `SELECT t.activation_account_id, COUNT(*)::int AS n
+         FROM transactions t
+         JOIN accounts a ON a.id = t.activation_account_id
+        WHERE a.merchant_id = $1 AND t.status = 'pending'
+        GROUP BY t.activation_account_id`,
+      [req.merchant.id]
+    );
+    const pendingByAccount = {};
+    for (const row of pend.rows) pendingByAccount[row.activation_account_id] = row.n;
 
     const g = await pool.query(
       `SELECT ${GATEWAY_COLS}, account_id
@@ -96,6 +110,10 @@ async function list(req, res, next) {
         gateways: gatewaysByAccount[acc.id] || [],
         txn_count: s.txn_count,
         txn_total: s.txn_total,
+        // Activation paywall (per-vendor, set by the merchant)
+        activation_fee:     Number(acc.activation_fee || 0),
+        is_activated:       acc.activated_at != null,
+        activation_pending: (pendingByAccount[acc.id] || 0) > 0,
       };
     });
 
@@ -257,4 +275,71 @@ async function remove(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { list, create, unlock, remove, extraAccountFee };
+/* ─── PATCH /api/merchant/accounts/:id ───
+ * Set a vendor's one-time activation fee. 0 = no activation gate. Only applies
+ * to non-Primary (vendor) accounts — you can't charge yourself to use Primary.
+ */
+async function setActivationFee(req, res, next) {
+  try {
+    const raw = req.body.activation_fee;
+    const fee = Number(raw);
+    if (!Number.isFinite(fee) || fee < 0) {
+      return res.status(400).json({ error: 'activation_fee must be a number ≥ 0' });
+    }
+    const acc = await pool.query(
+      'SELECT id, is_default FROM accounts WHERE id = $1 AND merchant_id = $2',
+      [req.params.id, req.merchant.id]
+    );
+    if (acc.rowCount === 0) return res.status(404).json({ error: 'Account not found' });
+    if (acc.rows[0].is_default) {
+      return res.status(400).json({ error: 'The Primary account has no activation fee.' });
+    }
+    const r = await pool.query(
+      `UPDATE accounts SET activation_fee = $1 WHERE id = $2 AND merchant_id = $3
+       RETURNING id, activation_fee, activated_at`,
+      [Math.round(fee * 100) / 100, req.params.id, req.merchant.id]
+    );
+    res.json({
+      ok: true,
+      activation_fee: Number(r.rows[0].activation_fee),
+      is_activated: r.rows[0].activated_at != null,
+    });
+  } catch (e) { next(e); }
+}
+
+/* ─── POST /api/merchant/accounts/:id/activate ───
+ * Manually activate a vendor (confirm their payment, or waive the fee). Sets
+ * activated_at and resolves any pending activation payment to success.
+ */
+async function activate(req, res, next) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const acc = await client.query(
+      'SELECT id, is_default, activated_at FROM accounts WHERE id = $1 AND merchant_id = $2 FOR UPDATE',
+      [req.params.id, req.merchant.id]
+    );
+    if (acc.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Account not found' }); }
+    if (acc.rows[0].is_default) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'The Primary account does not need activation.' }); }
+
+    if (acc.rows[0].activated_at == null) {
+      await client.query('UPDATE accounts SET activated_at = NOW() WHERE id = $1', [req.params.id]);
+    }
+    // Clear any pending activation payment so it doesn't linger.
+    await client.query(
+      `UPDATE transactions
+          SET status = 'success', result_source = 'manual', verified_at = NOW(), updated_at = NOW()
+        WHERE merchant_id = $1 AND activation_account_id = $2 AND status = 'pending'`,
+      [req.merchant.id, req.params.id]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true, is_activated: true });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { list, create, unlock, remove, extraAccountFee, setActivationFee, activate };

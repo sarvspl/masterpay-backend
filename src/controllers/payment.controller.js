@@ -678,10 +678,15 @@ async function listTransactions(req, res, next) {
                       g.account_id, a.label AS account_label, a.is_default AS account_is_default,
                       d.id AS device_uuid, d.model AS device_model, d.manufacturer AS device_manufacturer,
                       s.order_id, s.currency AS session_currency, s.redirect_url,
-                      b.name AS brand_name, b.domain AS brand_domain
+                      b.name AS brand_name, b.domain AS brand_domain,
+                      t.activation_account_id, t.vendor_topup_account_id,
+                      va.label AS activation_vendor_label, va.username AS activation_vendor_username,
+                      vt.label AS topup_vendor_label, vt.username AS topup_vendor_username
                  FROM transactions t
                  JOIN gateways g ON g.id = t.gateway_id
                  LEFT JOIN accounts a ON a.id = g.account_id
+                 LEFT JOIN accounts va ON va.id = t.activation_account_id
+                 LEFT JOIN accounts vt ON vt.id = t.vendor_topup_account_id
                  LEFT JOIN devices  d ON d.merchant_id = t.merchant_id AND d.device_id = t.result_device_id
                  LEFT JOIN payment_sessions s ON s.id = t.session_id
                  LEFT JOIN brands b ON b.id = COALESCE(t.brand_id, s.brand_id)
@@ -783,6 +788,9 @@ async function manualResolve(req, res, next) {
         `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
         [r.rows[0].session_id]
       );
+      // If this was a vendor-activation payment, unlock that vendor's panel.
+      await require('../services/activation').activateForTransaction(pool, r.rows[0].id)
+        .catch((e) => console.error('[activation] failed (manual resolve):', e.message));
       await creditWalletIfTopup(r.rows[0].session_id).catch((e) => console.error('[wallet] credit failed (manual resolve):', e.message));
       // Manual resolution still incurs the per-verification fee — the merchant
       // had to be reachable to click Mark Paid, so they should pay for it.

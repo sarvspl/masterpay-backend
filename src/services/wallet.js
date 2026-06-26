@@ -122,7 +122,10 @@ async function getPlatformSettings() {
     `SELECT verify_charge_amount, verify_charge_currency,
             verify_charge_enabled, low_balance_threshold,
             verify_charge_type, verify_charge_percent,
-            topup_fee_enabled, topup_fee_percent, key_unlock_fee
+            topup_fee_enabled, topup_fee_percent, key_unlock_fee,
+            vendor_activation_fee,
+            vendor_verify_charge_enabled, vendor_verify_charge_type,
+            vendor_verify_charge_amount, vendor_verify_charge_percent
        FROM platform_settings WHERE id = 1`
   );
   _settingsCache = r.rows[0] || {
@@ -130,6 +133,9 @@ async function getPlatformSettings() {
     verify_charge_enabled: false, low_balance_threshold: 0,
     verify_charge_type: 'fixed', verify_charge_percent: 0,
     topup_fee_enabled: false, topup_fee_percent: 0, key_unlock_fee: 0,
+    vendor_activation_fee: 0,
+    vendor_verify_charge_enabled: false, vendor_verify_charge_type: 'percent',
+    vendor_verify_charge_amount: 0, vendor_verify_charge_percent: 0,
   };
   _settingsCacheAt = now;
   return _settingsCache;
@@ -281,6 +287,22 @@ async function checkWalletSufficient(merchantId, paymentAmount = null) {
  */
 async function debitVerifyFee(merchantId, transactionId, sessionId, client = null) {
   const settings = await getPlatformSettings();
+
+  // If this transaction is on a VENDOR account, the vendor pays the fee from
+  // their OWN wallet (at the vendor rate) and the merchant is not charged.
+  const va = await pool.query(
+    `SELECT a.id AS account_id, a.is_default, a.external_id, a.username
+       FROM transactions t JOIN gateways g ON g.id = t.gateway_id JOIN accounts a ON a.id = g.account_id
+      WHERE t.id = $1`,
+    [transactionId]
+  );
+  if (va.rowCount > 0) {
+    const a = va.rows[0];
+    if (!a.is_default && (a.external_id != null || a.username != null)) {
+      return debitVendorVerifyFee(a.account_id, transactionId, settings, client);
+    }
+  }
+
   if (!settings.verify_charge_enabled) return null;
   // For percentage charging the exact fee depends on the payment amount, which
   // we read from the transaction row inside the locked query below. For fixed
@@ -417,6 +439,137 @@ async function getWalletStatusForMerchant(merchantId) {
   };
 }
 
+/* ─────────────────────────── VENDOR WALLET ─────────────────────────────────
+ * Vendors are billed like merchants but from their own per-account wallet, at
+ * an admin-set vendor-specific rate. */
+
+function computeVendorVerifyFee(settings, paymentAmount) {
+  if (!settings || !settings.vendor_verify_charge_enabled) return 0;
+  const type = settings.vendor_verify_charge_type || 'fixed';
+  if (type === 'percent') {
+    const pct = Number(settings.vendor_verify_charge_percent);
+    const amt = Number(paymentAmount);
+    if (!Number.isFinite(pct) || pct <= 0) return 0;
+    if (!Number.isFinite(amt) || amt <= 0) return 0;
+    return Math.round(amt * pct) / 100;
+  }
+  const fixed = Number(settings.vendor_verify_charge_amount);
+  return Number.isFinite(fixed) && fixed > 0 ? fixed : 0;
+}
+
+// Is this vendor's wallet able to cover a verification? Returns
+// { ok, balance, fee, enabled, reason? }. When charging is off, always ok.
+async function checkVendorWalletSufficient(accountId, paymentAmount = null) {
+  const settings = await getPlatformSettings();
+  const type = settings.vendor_verify_charge_type || 'fixed';
+  const charging = settings.vendor_verify_charge_enabled && (
+    type === 'percent'
+      ? Number(settings.vendor_verify_charge_percent) > 0
+      : Number(settings.vendor_verify_charge_amount) > 0
+  );
+  if (!charging) return { ok: true, balance: null, fee: 0, enabled: false };
+
+  const a = await pool.query('SELECT wallet_balance FROM accounts WHERE id = $1', [accountId]);
+  if (a.rowCount === 0) return { ok: false, reason: 'account_not_found' };
+  const balance = Number(a.rows[0].wallet_balance);
+  const fee = type === 'percent'
+    ? (paymentAmount != null ? computeVendorVerifyFee(settings, paymentAmount) : 0)
+    : Number(settings.vendor_verify_charge_amount);
+  const required = (type === 'percent' && paymentAmount == null) ? 0.01 : fee;
+  if (balance < required) {
+    return { ok: false, balance, fee, enabled: true, reason: 'insufficient_balance' };
+  }
+  return { ok: true, balance, fee, enabled: true };
+}
+
+// Debit the per-verification fee from a VENDOR's wallet. Mirrors
+// debitVerifyFee: atomic, idempotent (uniq_debit_verify_per_transaction),
+// refuses to go negative. Records platform revenue.
+async function debitVendorVerifyFee(accountId, transactionId, settings, client = null) {
+  if (!settings.vendor_verify_charge_enabled) return null;
+  const chargeType = settings.vendor_verify_charge_type || 'fixed';
+  if (chargeType !== 'percent' && Number(settings.vendor_verify_charge_amount) <= 0) return null;
+
+  const ownsClient = !client;
+  const c = client || await pool.connect();
+  try {
+    if (ownsClient) await c.query('BEGIN');
+    const guard = await c.query(
+      `SELECT a.wallet_balance, a.merchant_id,
+              (SELECT amount FROM transactions WHERE id = $2) AS tx_amount
+         FROM accounts a WHERE a.id = $1 FOR UPDATE`,
+      [accountId, transactionId]
+    );
+    if (guard.rowCount === 0) { if (ownsClient) await c.query('ROLLBACK'); return null; }
+
+    const fee = computeVendorVerifyFee(settings, guard.rows[0].tx_amount);
+    if (fee <= 0) { if (ownsClient) await c.query('ROLLBACK'); return null; }
+
+    const balance = Number(guard.rows[0].wallet_balance);
+    if (balance < fee) {
+      console.warn(`[wallet] vendor debit refused — account ${accountId} balance ${balance} < fee ${fee} (tx ${transactionId})`);
+      if (ownsClient) await c.query('ROLLBACK');
+      return null;
+    }
+
+    const note = chargeType === 'percent'
+      ? `Verification fee (${Number(settings.vendor_verify_charge_percent)}%)`
+      : 'Verification fee';
+    let ledger = null;
+    try {
+      const ins = await c.query(
+        `INSERT INTO wallet_ledger (merchant_id, account_id, amount, kind, source_transaction_id, note)
+         VALUES ($1, $2, $3, 'debit_verify', $4, $5)
+         RETURNING id, amount, kind, created_at`,
+        [guard.rows[0].merchant_id, accountId, -fee, transactionId, note]
+      );
+      ledger = ins.rows[0];
+    } catch (e) {
+      if (e.code === '23505') { if (ownsClient) await c.query('ROLLBACK'); return null; }
+      throw e;
+    }
+
+    await c.query('UPDATE accounts SET wallet_balance = wallet_balance - $1 WHERE id = $2', [fee, accountId]);
+    await recordPlatformRevenue(c, {
+      type: 'verify_fee', amount: fee, currency: settings.verify_charge_currency,
+      merchantId: guard.rows[0].merchant_id, sourceTransactionId: transactionId, note: 'Vendor ' + note,
+    });
+    if (ownsClient) await c.query('COMMIT');
+    return ledger;
+  } catch (e) {
+    if (ownsClient) { try { await c.query('ROLLBACK'); } catch {} }
+    throw e;
+  } finally {
+    if (ownsClient) c.release();
+  }
+}
+
+// Credit a vendor's wallet for a confirmed top-up payment. Idempotent via
+// uniq_vendor_topup_per_transaction. Returns true if it credited.
+async function creditVendorTopup(db, transactionId) {
+  const t = await db.query(
+    `SELECT t.amount, t.vendor_topup_account_id AS account_id, a.merchant_id
+       FROM transactions t JOIN accounts a ON a.id = t.vendor_topup_account_id
+      WHERE t.id = $1 AND t.vendor_topup_account_id IS NOT NULL`,
+    [transactionId]
+  );
+  if (t.rowCount === 0) return false;
+  const amount = Number(t.rows[0].amount);
+  if (!(amount > 0)) return false;
+  try {
+    await db.query(
+      `INSERT INTO wallet_ledger (merchant_id, account_id, amount, kind, source_transaction_id, note)
+       VALUES ($1, $2, $3, 'vendor_topup', $4, 'Wallet top-up')`,
+      [t.rows[0].merchant_id, t.rows[0].account_id, amount, transactionId]
+    );
+  } catch (e) {
+    if (e.code === '23505') return false; // already credited
+    throw e;
+  }
+  await db.query('UPDATE accounts SET wallet_balance = wallet_balance + $1 WHERE id = $2', [amount, t.rows[0].account_id]);
+  return true;
+}
+
 module.exports = {
   creditWalletIfTopup,
   debitVerifyFee,
@@ -427,4 +580,8 @@ module.exports = {
   computeTopupFee,
   recordPlatformRevenue,
   invalidatePlatformSettingsCache,
+  computeVendorVerifyFee,
+  checkVendorWalletSufficient,
+  debitVendorVerifyFee,
+  creditVendorTopup,
 };

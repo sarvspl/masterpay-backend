@@ -249,6 +249,11 @@ async function tryAutoMatch(client, merchantId, smsId, smsBody) {
         const { creditWalletIfTopup } = require('../services/wallet');
         await creditWalletIfTopup(tx.session_id, client);
       } catch (e) { console.error('[wallet] credit failed (sms auto-match):', e.message); }
+      // If this was a vendor-activation payment, unlock that vendor's panel.
+      try {
+        const { activateForTransaction } = require('../services/activation');
+        await activateForTransaction(client, tx.id);
+      } catch (e) { console.error('[activation] failed (sms auto-match):', e.message); }
       return tx.id;
     }
   }

@@ -13,6 +13,65 @@ const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
 const { sign } = require('../utils/jwt');
 const { getPlatformSettings } = require('../services/wallet');
+const smsCtrl = require('./sms.controller');
+const { settleForTransaction } = require('../services/activation');
+
+/**
+ * Try to auto-confirm a vendor's pending platform payment (activation OR wallet
+ * top-up) by matching the TxnID they submitted against the platform's recent
+ * SMS — the same logic the customer checkout uses (submitTxn Path C). On a
+ * match the payment flips to success and is settled (activate / credit wallet).
+ * Returns true if it settled. Safe to call repeatedly (idempotent).
+ */
+async function attemptVendorPaymentMatch(accountId) {
+  const tx = await pool.query(
+    `SELECT t.id, t.merchant_id, t.gateway_id, t.txnid_submitted, t.amount,
+            g.provider, g.variant, g.account_number, g.account_id
+       FROM transactions t JOIN gateways g ON g.id = t.gateway_id
+      WHERE (t.activation_account_id = $1 OR t.vendor_topup_account_id = $1)
+        AND t.status = 'pending'
+      ORDER BY t.created_at DESC LIMIT 1`,
+    [accountId]
+  );
+  if (tx.rowCount === 0) return false;
+  const t = tx.rows[0];
+
+  // The vendor may have paid ANY of the platform's receiving numbers, so match
+  // the SMS against all of them (not just the one the row happens to reference).
+  const gws = await pool.query(
+    `SELECT id, provider, variant, account_number, account_id
+       FROM gateways WHERE merchant_id = $1 AND is_enabled = TRUE`,
+    [t.merchant_id]
+  );
+  const gateways = gws.rows.length ? gws.rows : [{
+    id: t.gateway_id, provider: t.provider, variant: t.variant,
+    account_number: t.account_number, account_id: t.account_id,
+  }];
+  const sms = await pool.query(
+    `SELECT id, body FROM sms_messages
+      WHERE merchant_id = $1
+        AND received_at > NOW() - INTERVAL '15 minutes'
+        AND LOWER(body) LIKE LOWER('%' || $2 || '%')
+      ORDER BY received_at DESC LIMIT 5`,
+    [t.merchant_id, t.txnid_submitted]
+  );
+  for (const s of sms.rows) {
+    if (smsCtrl.extractDirection(s.body) === 'debit') continue;
+    if (!smsCtrl.findGatewayInSms(s.body, gateways)) continue;
+    if (!smsCtrl.smsMatchesTransaction(s.body, { txnid_submitted: t.txnid_submitted, amount: Number(t.amount), customer_phone: null })) continue;
+    const upd = await pool.query(
+      `UPDATE transactions SET status='success', result_source='sms_late_match',
+              matched_sms=$2, verified_at=NOW(), updated_at=NOW()
+        WHERE id=$1 AND status='pending' RETURNING id`,
+      [t.id, s.body]
+    );
+    if (upd.rowCount === 0) return false; // lost a race
+    await pool.query('UPDATE sms_messages SET matched_tx_id=$1 WHERE id=$2', [t.id, s.id]);
+    await settleForTransaction(pool, t.id);
+    return true;
+  }
+  return false;
+}
 
 const USERNAME_RE = /^[a-z0-9_]{3,40}$/;
 
@@ -140,6 +199,16 @@ async function me(req, res, next) {
   try {
     const accountId = req.vendor.account_id;
 
+    // Lazy auto-confirm: while gated, try to match any pending activation
+    // payment against the merchant's recent SMS (the panel polls this).
+    if (req.vendor.needs_activation) {
+      const activated = await attemptVendorPaymentMatch(accountId).catch(() => false);
+      if (activated) {
+        req.vendor.needs_activation = false;
+        req.vendor.activated_at = new Date();
+      }
+    }
+
     const a = await pool.query(
       `SELECT a.id, a.label, a.username, a.is_default, a.keys_unlocked, a.device_auth_key,
               a.created_at, a.last_login_at,
@@ -174,6 +243,30 @@ async function me(req, res, next) {
       [accountId]
     );
 
+    // Activation: where to pay (the merchant's Primary number) and any payment
+    // already submitted and awaiting confirmation.
+    let payTo = [];
+    let pendingActivation = null;
+    if (req.vendor.needs_activation) {
+      // The fee is paid to the PLATFORM (MASTER PAY), so show the platform's
+      // receiving numbers.
+      const pg = await pool.query(
+        `SELECT g.provider, g.variant, g.account_number, g.label
+           FROM gateways g JOIN merchants m ON m.id = g.merchant_id
+          WHERE m.is_platform = TRUE AND g.is_enabled = TRUE
+          ORDER BY g.created_at ASC`
+      );
+      payTo = pg.rows;
+      const pend = await pool.query(
+        `SELECT id, txnid_submitted, amount, status, created_at
+           FROM transactions
+          WHERE activation_account_id = $1 AND status = 'pending'
+          ORDER BY created_at DESC LIMIT 1`,
+        [accountId]
+      );
+      pendingActivation = pend.rows[0] || null;
+    }
+
     res.json({
       vendor: {
         id:              acc.id,
@@ -190,6 +283,12 @@ async function me(req, res, next) {
         txn_count:       stats.rows[0].txn_count,
         txn_total:       Number(stats.rows[0].txn_total),
         pending_count:   stats.rows[0].pending_count,
+        // Activation paywall
+        needs_activation:   req.vendor.needs_activation,
+        activation_fee:     req.vendor.activation_fee,
+        activated_at:       req.vendor.activated_at,
+        pay_to:             payTo,
+        pending_activation: pendingActivation,
       },
       window: String(req.query.window || 'all').toLowerCase(),
     });
@@ -217,4 +316,212 @@ async function changePassword(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { register, login, me, changePassword };
+/* ─── POST /api/vendor/activation/submit ───
+ * The vendor submits the TxnID + sender + screenshot of the activation-fee
+ * payment they made to the merchant's Primary number. We create a PENDING
+ * transaction tagged as an activation; it confirms via SMS auto-match (the
+ * merchant's bound phone) or the merchant's manual Approve, which sets
+ * accounts.activated_at and unlocks the panel.
+ */
+async function submitActivation(req, res, next) {
+  try {
+    if (!req.vendor.needs_activation) {
+      return res.status(400).json({ error: 'Your account is already activated.' });
+    }
+    const txnid = String(req.body.txnid || '').trim();
+    const sender_account = String(req.body.sender_account || '').trim();
+    const proof_image = typeof req.body.proof_image === 'string' ? req.body.proof_image : '';
+    if (!txnid) return res.status(400).json({ error: 'Transaction ID is required' });
+    if (!sender_account) return res.status(400).json({ error: 'Sender number is required' });
+    if (!/^[0-9+\-\s]{4,40}$/.test(sender_account)) return res.status(400).json({ error: 'Enter a valid sender mobile/account number' });
+    if (!proof_image) return res.status(400).json({ error: 'Payment screenshot is required' });
+
+    // The fee is paid to the PLATFORM (MASTER PAY) — pick its first enabled gateway.
+    const pg = await pool.query(
+      `SELECT g.id, m.id AS platform_merchant_id
+         FROM gateways g JOIN merchants m ON m.id = g.merchant_id
+        WHERE m.is_platform = TRUE AND g.is_enabled = TRUE
+        ORDER BY g.created_at ASC LIMIT 1`
+    );
+    if (pg.rowCount === 0) {
+      return res.status(409).json({
+        error: 'Activation is temporarily unavailable — no payment number is configured. Please try again later or contact support.',
+        code: 'no_platform_gateway',
+      });
+    }
+    const gatewayId = pg.rows[0].id;
+    const platformMerchantId = pg.rows[0].platform_merchant_id;
+
+    // Anti-replay: a TxnID is unique per (platform) merchant.
+    const dup = await pool.query(
+      `SELECT id, status FROM transactions
+        WHERE merchant_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
+        ORDER BY created_at DESC LIMIT 1`,
+      [platformMerchantId, txnid]
+    );
+    if (dup.rowCount > 0) {
+      const e = dup.rows[0];
+      // Re-submitting the same pending activation txn → treat as idempotent.
+      if (e.status === 'pending') return res.status(200).json({ ok: true, status: 'pending', duplicate: true });
+      return res.status(409).json({ error: 'This Transaction ID has already been used.' , existing_status: e.status });
+    }
+
+    let proof_image_url = null;
+    try {
+      proof_image_url = require('../services/proof').saveProofImage(proof_image);
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
+
+    const r = await pool.query(
+      `INSERT INTO transactions
+         (merchant_id, gateway_id, txnid_submitted, amount, sender_account, proof_image_url, activation_account_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, status, created_at`,
+      [platformMerchantId, gatewayId, txnid, req.vendor.activation_fee, sender_account, proof_image_url, req.vendor.account_id]
+    );
+
+    // Immediate auto-confirm if the platform's SMS for this TxnID already arrived.
+    const matched = await attemptVendorPaymentMatch(req.vendor.account_id).catch(() => false);
+    if (matched) {
+      return res.status(200).json({ ok: true, status: 'success', activated: true });
+    }
+
+    // Otherwise ping the platform's bound phone(s) so the admin can approve.
+    try {
+      const { notifyVerifyRequest } = require('../utils/push');
+      notifyVerifyRequest(platformMerchantId, {
+        verification_id: r.rows[0].id,
+        txnid,
+        amount: Number(req.vendor.activation_fee).toFixed(2),
+        note: `Vendor activation: ${req.vendor.username}`,
+        created_at: r.rows[0].created_at,
+      }).catch(() => {});
+    } catch {}
+
+    res.status(202).json({ ok: true, status: 'pending', transaction_id: r.rows[0].id });
+  } catch (e) {
+    if (e && e.code === '23505') return res.status(409).json({ error: 'This Transaction ID has already been used.' });
+    next(e);
+  }
+}
+
+/* ─── GET /api/vendor/wallet ───
+ * The vendor's wallet: balance, recent ledger, low-balance flag, and where to
+ * top up (the platform's numbers).
+ */
+async function getWallet(req, res, next) {
+  try {
+    const accountId = req.vendor.account_id;
+    const a = await pool.query(
+      `SELECT a.wallet_balance, m.currency FROM accounts a JOIN merchants m ON m.id = a.merchant_id WHERE a.id = $1`,
+      [accountId]
+    );
+    if (a.rowCount === 0) return res.status(404).json({ error: 'Vendor not found' });
+    const balance = Number(a.rows[0].wallet_balance);
+
+    const settings = await getPlatformSettings().catch(() => ({}));
+    const chargingEnabled = !!settings.vendor_verify_charge_enabled && (
+      (settings.vendor_verify_charge_type || 'fixed') === 'percent'
+        ? Number(settings.vendor_verify_charge_percent) > 0
+        : Number(settings.vendor_verify_charge_amount) > 0
+    );
+    const threshold = Number(settings.low_balance_threshold || 0);
+
+    const ledger = await pool.query(
+      `SELECT amount, kind, note, created_at FROM wallet_ledger
+        WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [accountId]
+    );
+    const payTo = await pool.query(
+      `SELECT g.provider, g.variant, g.account_number, g.label
+         FROM gateways g JOIN merchants m ON m.id = g.merchant_id
+        WHERE m.is_platform = TRUE AND g.is_enabled = TRUE ORDER BY g.created_at ASC`
+    );
+
+    res.json({
+      wallet: {
+        balance,
+        currency: a.rows[0].currency || 'BDT',
+        charging_enabled: chargingEnabled,
+        charge_type: settings.vendor_verify_charge_type || 'percent',
+        charge_amount: Number(settings.vendor_verify_charge_amount || 0),
+        charge_percent: Number(settings.vendor_verify_charge_percent || 0),
+        low_balance_threshold: threshold,
+        low_balance: chargingEnabled && balance < threshold,
+        pay_to: payTo.rows,
+        ledger: ledger.rows,
+      },
+    });
+  } catch (e) { next(e); }
+}
+
+/* ─── POST /api/vendor/wallet/topup ───
+ * Body: { amount, txnid, sender_account, proof_image }
+ * The vendor paid `amount` to the platform; we book a pending top-up payment.
+ * On confirmation (SMS auto-match or admin Approve) the wallet is credited.
+ */
+async function submitTopup(req, res, next) {
+  try {
+    const amount = Number(req.body.amount);
+    const txnid = String(req.body.txnid || '').trim();
+    const sender_account = String(req.body.sender_account || '').trim();
+    const proof_image = typeof req.body.proof_image === 'string' ? req.body.proof_image : '';
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'Enter a valid top-up amount' });
+    if (!txnid) return res.status(400).json({ error: 'Transaction ID is required' });
+    if (!sender_account) return res.status(400).json({ error: 'Sender number is required' });
+    if (!/^[0-9+\-\s]{4,40}$/.test(sender_account)) return res.status(400).json({ error: 'Enter a valid sender mobile/account number' });
+    if (!proof_image) return res.status(400).json({ error: 'Payment screenshot is required' });
+
+    const pg = await pool.query(
+      `SELECT g.id, m.id AS platform_merchant_id
+         FROM gateways g JOIN merchants m ON m.id = g.merchant_id
+        WHERE m.is_platform = TRUE AND g.is_enabled = TRUE
+        ORDER BY g.created_at ASC LIMIT 1`
+    );
+    if (pg.rowCount === 0) {
+      return res.status(409).json({ error: 'Top-up is temporarily unavailable — no payment number is configured.', code: 'no_platform_gateway' });
+    }
+    const gatewayId = pg.rows[0].id;
+    const platformMerchantId = pg.rows[0].platform_merchant_id;
+
+    const dup = await pool.query(
+      `SELECT id, status FROM transactions WHERE merchant_id = $1 AND LOWER(txnid_submitted) = LOWER($2) ORDER BY created_at DESC LIMIT 1`,
+      [platformMerchantId, txnid]
+    );
+    if (dup.rowCount > 0) {
+      if (dup.rows[0].status === 'pending') return res.status(200).json({ ok: true, status: 'pending', duplicate: true });
+      return res.status(409).json({ error: 'This Transaction ID has already been used.', existing_status: dup.rows[0].status });
+    }
+
+    let proof_image_url = null;
+    try { proof_image_url = require('../services/proof').saveProofImage(proof_image); }
+    catch (e) { return res.status(e.status || 400).json({ error: e.message }); }
+
+    const r = await pool.query(
+      `INSERT INTO transactions
+         (merchant_id, gateway_id, txnid_submitted, amount, sender_account, proof_image_url, vendor_topup_account_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, created_at`,
+      [platformMerchantId, gatewayId, txnid, Math.round(amount * 100) / 100, sender_account, proof_image_url, req.vendor.account_id]
+    );
+
+    const matched = await attemptVendorPaymentMatch(req.vendor.account_id).catch(() => false);
+    if (matched) return res.status(200).json({ ok: true, status: 'success', credited: true });
+
+    try {
+      const { notifyVerifyRequest } = require('../utils/push');
+      notifyVerifyRequest(platformMerchantId, {
+        verification_id: r.rows[0].id, txnid, amount: amount.toFixed(2),
+        note: `Vendor wallet top-up: ${req.vendor.username}`, created_at: r.rows[0].created_at,
+      }).catch(() => {});
+    } catch {}
+
+    res.status(202).json({ ok: true, status: 'pending', transaction_id: r.rows[0].id });
+  } catch (e) {
+    if (e && e.code === '23505') return res.status(409).json({ error: 'This Transaction ID has already been used.' });
+    next(e);
+  }
+}
+
+module.exports = { register, login, me, changePassword, submitActivation, getWallet, submitTopup };

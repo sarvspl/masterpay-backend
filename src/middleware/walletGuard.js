@@ -14,7 +14,7 @@
  *     payload is fine here.
  */
 const pool = require('../db/pool');
-const { checkWalletSufficient } = require('../services/wallet');
+const { checkWalletSufficient, checkVendorWalletSufficient } = require('../services/wallet');
 
 // Customer-safe 402 — the merchant's integration sometimes leaks our error
 // payload straight to the customer, so the `error` text must be neutral and
@@ -48,6 +48,24 @@ async function guardMerchant(req, res, next) {
   try {
     const merchantId = req.brand && req.brand.merchant_id;
     if (!merchantId) return next();
+
+    // Vendor-scoped session → the VENDOR pays the verification fee, so gate on
+    // the vendor's wallet (not the merchant's). Verify the vendor belongs to
+    // this merchant first; if it isn't a valid vendor, fall through to the
+    // merchant check and let the session controller return the precise 400.
+    const vendorId = req.body && req.body.vendor_id ? String(req.body.vendor_id).trim() : null;
+    if (vendorId) {
+      const a = await pool.query(
+        'SELECT id FROM accounts WHERE id = $1 AND merchant_id = $2 AND is_default = FALSE',
+        [vendorId, merchantId]
+      );
+      if (a.rowCount > 0) {
+        const check = await checkVendorWalletSufficient(vendorId);
+        if (!check.ok) return rejectCustomerSafe(res);
+        return next();
+      }
+    }
+
     const check = await checkWalletSufficient(merchantId);
     if (!check.ok) return rejectCustomerSafe(res);
     next();

@@ -17,7 +17,7 @@ const vendorCtrl = require('../controllers/vendor.controller');
 const gatewayCtrl = require('../controllers/gateway.controller');
 const paymentCtrl = require('../controllers/payment.controller');
 const deviceCtrl = require('../controllers/device.controller');
-const { requireVendor } = require('../middleware/auth');
+const { requireVendor, requireActivated } = require('../middleware/auth');
 const { limiters } = require('../middleware/rateLimit');
 const pool = require('../db/pool');
 
@@ -52,24 +52,31 @@ async function ownTxn(req, res, next) {
   } catch (e) { next(e); }
 }
 
-/* ── Auth + profile ── */
-router.post('/register',     vendorCtrl.register);
-router.post('/login',        limiters.login, vendorCtrl.login);
-router.get ('/me',           requireVendor, vendorCtrl.me);
-router.post('/me/password',  requireVendor, vendorCtrl.changePassword);
+/* ── Auth + profile (always open so the pay screen can render) ── */
+router.post('/register',           vendorCtrl.register);
+router.post('/login',              limiters.login, vendorCtrl.login);
+router.get ('/me',                 requireVendor, vendorCtrl.me);
+router.post('/me/password',        requireVendor, vendorCtrl.changePassword);
+router.post('/activation/submit',  requireVendor, vendorCtrl.submitActivation);
+
+/* ── Everything below requires an ACTIVATED vendor ── */
 
 /* ── Transactions (with approve/reject) ── */
-router.get ('/transactions',             requireVendor, asMerchant, scopeAccountQuery, paymentCtrl.listTransactions);
-router.post('/transactions/:id/resolve', requireVendor, asMerchant, ownTxn, paymentCtrl.manualResolve);
+router.get ('/transactions',             requireVendor, requireActivated, asMerchant, scopeAccountQuery, paymentCtrl.listTransactions);
+router.post('/transactions/:id/resolve', requireVendor, requireActivated, asMerchant, ownTxn, paymentCtrl.manualResolve);
 
 /* ── Gateways (full self-service) ── */
-router.get   ('/gateways',            requireVendor, asMerchant, scopeAccountQuery, gatewayCtrl.list);
-router.post  ('/gateways',            requireVendor, asMerchant, scopeAccountBody, gatewayCtrl.create);
-router.patch ('/gateways/:id',        requireVendor, asMerchant, ownGateway, gatewayCtrl.update);
-router.post  ('/gateways/:id/toggle', requireVendor, asMerchant, ownGateway, gatewayCtrl.toggle);
-router.delete('/gateways/:id',        requireVendor, asMerchant, ownGateway, gatewayCtrl.remove);
+router.get   ('/gateways',            requireVendor, requireActivated, asMerchant, scopeAccountQuery, gatewayCtrl.list);
+router.post  ('/gateways',            requireVendor, requireActivated, asMerchant, scopeAccountBody, gatewayCtrl.create);
+router.patch ('/gateways/:id',        requireVendor, requireActivated, asMerchant, ownGateway, gatewayCtrl.update);
+router.post  ('/gateways/:id/toggle', requireVendor, requireActivated, asMerchant, ownGateway, gatewayCtrl.toggle);
+router.delete('/gateways/:id',        requireVendor, requireActivated, asMerchant, ownGateway, gatewayCtrl.remove);
 
 /* ── Devices (the phones bound to this vendor) ── */
-router.get('/devices', requireVendor, asMerchant, scopeAccountQuery, deviceCtrl.listForMerchant);
+router.get('/devices', requireVendor, requireActivated, asMerchant, scopeAccountQuery, deviceCtrl.listForMerchant);
+
+/* ── Wallet (balance, ledger, top-up) ── */
+router.get ('/wallet',        requireVendor, requireActivated, vendorCtrl.getWallet);
+router.post('/wallet/topup',  requireVendor, requireActivated, vendorCtrl.submitTopup);
 
 module.exports = router;

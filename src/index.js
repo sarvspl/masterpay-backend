@@ -24,7 +24,11 @@ app.use(cors());
 const stdJson = express.json({ limit: '1mb' });
 const bigJson = express.json({ limit: '8mb' });
 app.use((req, res, next) => {
-  if (req.method === 'POST' && /^\/api\/checkout\/[^/]+\/submit$/.test(req.path)) {
+  if (req.method === 'POST' && (
+    /^\/api\/checkout\/[^/]+\/submit$/.test(req.path) ||
+    req.path === '/api/vendor/activation/submit' ||
+    req.path === '/api/vendor/wallet/topup'
+  )) {
     return bigJson(req, res, next);
   }
   return stdJson(req, res, next);

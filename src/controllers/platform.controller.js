@@ -112,12 +112,19 @@ const SETTINGS_FIELDS = [
   'topup_fee_enabled',
   'topup_fee_percent',
   'key_unlock_fee',
+  'vendor_activation_fee',
+  'vendor_verify_charge_enabled',
+  'vendor_verify_charge_type',
+  'vendor_verify_charge_amount',
+  'vendor_verify_charge_percent',
 ];
 
 const SETTINGS_COLUMNS =
   `verify_charge_amount, verify_charge_currency, verify_charge_enabled,
    low_balance_threshold, verify_charge_type, verify_charge_percent,
-   topup_fee_enabled, topup_fee_percent, key_unlock_fee, updated_at`;
+   topup_fee_enabled, topup_fee_percent, key_unlock_fee,
+   vendor_activation_fee, vendor_verify_charge_enabled, vendor_verify_charge_type,
+   vendor_verify_charge_amount, vendor_verify_charge_percent, updated_at`;
 
 async function getSettings(req, res, next) {
   try {
@@ -129,6 +136,9 @@ async function getSettings(req, res, next) {
       verify_charge_enabled: false, low_balance_threshold: 0,
       verify_charge_type: 'fixed', verify_charge_percent: 0,
       topup_fee_enabled: false, topup_fee_percent: 0, key_unlock_fee: 0,
+      vendor_activation_fee: 0,
+      vendor_verify_charge_enabled: false, vendor_verify_charge_type: 'percent',
+      vendor_verify_charge_amount: 0, vendor_verify_charge_percent: 0,
     } });
   } catch (e) { next(e); }
 }
@@ -178,6 +188,27 @@ async function updateSettings(req, res, next) {
       const n = Number(patch.key_unlock_fee);
       if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'key_unlock_fee must be a non-negative number' });
       patch.key_unlock_fee = n;
+    }
+    if ('vendor_activation_fee' in patch) {
+      const n = Number(patch.vendor_activation_fee);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'vendor_activation_fee must be a non-negative number' });
+      patch.vendor_activation_fee = n;
+    }
+    if ('vendor_verify_charge_enabled' in patch) patch.vendor_verify_charge_enabled = !!patch.vendor_verify_charge_enabled;
+    if ('vendor_verify_charge_type' in patch) {
+      const t = String(patch.vendor_verify_charge_type || '').trim().toLowerCase();
+      if (t !== 'fixed' && t !== 'percent') return res.status(400).json({ error: "vendor_verify_charge_type must be 'fixed' or 'percent'" });
+      patch.vendor_verify_charge_type = t;
+    }
+    if ('vendor_verify_charge_amount' in patch) {
+      const n = Number(patch.vendor_verify_charge_amount);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'vendor_verify_charge_amount must be a non-negative number' });
+      patch.vendor_verify_charge_amount = n;
+    }
+    if ('vendor_verify_charge_percent' in patch) {
+      const n = Number(patch.vendor_verify_charge_percent);
+      if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'vendor_verify_charge_percent must be between 0 and 100' });
+      patch.vendor_verify_charge_percent = n;
     }
 
     if (Object.keys(patch).length === 0) {

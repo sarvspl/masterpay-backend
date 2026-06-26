@@ -25,9 +25,16 @@ router.post  ('/brands',     requireMerchant, ctrl.createBrand);
 router.delete('/brands/:id', requireMerchant, ctrl.deleteBrand);
 
 router.get   ('/accounts',            requireMerchant, accountsCtrl.list);
-router.post  ('/accounts',            requireMerchant, accountsCtrl.create);
-router.post  ('/accounts/:id/unlock', requireMerchant, accountsCtrl.unlock);
-router.delete('/accounts/:id',        requireMerchant, accountsCtrl.remove);
+// Manual account creation from the dashboard is disabled — accounts (vendors)
+// are provisioned through the marketplace API (POST /api/vendors). The handler
+// below is intentionally kept (not deleted) so an accidental call gets a clear
+// 403 rather than a 404. accountsCtrl.create is left exported but unwired.
+router.post  ('/accounts',            requireMerchant, (req, res) => res.status(403).json({
+  error: 'Creating accounts from the dashboard is disabled. Vendors are provisioned through the marketplace API (POST /api/vendors).',
+  code: 'account_create_disabled',
+}));
+router.post  ('/accounts/:id/unlock',   requireMerchant, accountsCtrl.unlock);
+router.delete('/accounts/:id',          requireMerchant, accountsCtrl.remove);
 
 router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
 router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);
