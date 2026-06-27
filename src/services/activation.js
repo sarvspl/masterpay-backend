@@ -18,23 +18,29 @@ async function settleForTransaction(db, transactionId) {
       WHERE t.id = $1
         AND t.activation_account_id = a.id
         AND a.activated_at IS NULL
-      RETURNING a.id, t.amount`,
+      RETURNING a.id, a.merchant_id, t.amount`,
     [transactionId]
   );
   if (r.rowCount > 0) {
     did = true;
     try {
-      const { recordPlatformRevenue, getPlatformSettings } = require('./wallet');
+      const { recordPlatformRevenue, getPlatformSettings, computeMerchantCommission, creditMerchantCommission } = require('./wallet');
       const settings = await getPlatformSettings().catch(() => ({ verify_charge_currency: 'BDT' }));
+      const fee = Number(r.rows[0].amount);
+      // Commission split: merchant earns a % of the joining fee; platform keeps the rest.
+      const commission = computeMerchantCommission(settings, 'join', fee);
+      if (commission > 0) {
+        await creditMerchantCommission(db, r.rows[0].merchant_id, commission, transactionId, 'Vendor joining commission');
+      }
       await recordPlatformRevenue(db, {
         type: 'vendor_activation',
-        amount: Number(r.rows[0].amount),
+        amount: fee - commission,
         currency: settings.verify_charge_currency || 'BDT',
         sourceTransactionId: transactionId,
         note: 'Vendor activation fee',
       });
     } catch (e) {
-      console.error('[settle] activation revenue record failed:', e.message);
+      console.error('[settle] activation settle failed:', e.message);
     }
   }
 

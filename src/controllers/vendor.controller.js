@@ -12,7 +12,7 @@
 const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
 const { sign } = require('../utils/jwt');
-const { getPlatformSettings } = require('../services/wallet');
+const { getPlatformSettings, computeVendorTopupFee } = require('../services/wallet');
 const smsCtrl = require('./sms.controller');
 const { settleForTransaction } = require('../services/activation');
 
@@ -449,6 +449,8 @@ async function getWallet(req, res, next) {
         charge_percent: Number(settings.vendor_verify_charge_percent || 0),
         low_balance_threshold: threshold,
         low_balance: chargingEnabled && balance < threshold,
+        topup_fee_enabled: !!settings.vendor_topup_fee_enabled,
+        topup_fee_percent: Number(settings.vendor_topup_fee_percent || 0),
         pay_to: payTo.rows,
         ledger: ledger.rows,
       },
@@ -498,12 +500,20 @@ async function submitTopup(req, res, next) {
     try { proof_image_url = require('../services/proof').saveProofImage(proof_image); }
     catch (e) { return res.status(e.status || 400).json({ error: e.message }); }
 
+    // amount = what the vendor wants credited (NET). They pay NET + top-up fee
+    // (GROSS); the gross is what lands on the platform's number and the row's
+    // amount, so SMS auto-match still works.
+    const settings = await getPlatformSettings().catch(() => ({}));
+    const net = Math.round(amount * 100) / 100;
+    const fee = computeVendorTopupFee(settings, net);
+    const gross = Math.round((net + fee) * 100) / 100;
+
     const r = await pool.query(
       `INSERT INTO transactions
-         (merchant_id, gateway_id, txnid_submitted, amount, sender_account, proof_image_url, vendor_topup_account_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+         (merchant_id, gateway_id, txnid_submitted, amount, sender_account, proof_image_url, vendor_topup_account_id, vendor_topup_credit_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id, created_at`,
-      [platformMerchantId, gatewayId, txnid, Math.round(amount * 100) / 100, sender_account, proof_image_url, req.vendor.account_id]
+      [platformMerchantId, gatewayId, txnid, gross, sender_account, proof_image_url, req.vendor.account_id, net]
     );
 
     const matched = await attemptVendorPaymentMatch(req.vendor.account_id).catch(() => false);
@@ -512,7 +522,7 @@ async function submitTopup(req, res, next) {
     try {
       const { notifyVerifyRequest } = require('../utils/push');
       notifyVerifyRequest(platformMerchantId, {
-        verification_id: r.rows[0].id, txnid, amount: amount.toFixed(2),
+        verification_id: r.rows[0].id, txnid, amount: gross.toFixed(2),
         note: `Vendor wallet top-up: ${req.vendor.username}`, created_at: r.rows[0].created_at,
       }).catch(() => {});
     } catch {}

@@ -117,6 +117,12 @@ const SETTINGS_FIELDS = [
   'vendor_verify_charge_type',
   'vendor_verify_charge_amount',
   'vendor_verify_charge_percent',
+  'merchant_commission_join_enabled',
+  'merchant_commission_join_percent',
+  'merchant_commission_verify_enabled',
+  'merchant_commission_verify_percent',
+  'vendor_topup_fee_enabled',
+  'vendor_topup_fee_percent',
 ];
 
 const SETTINGS_COLUMNS =
@@ -124,7 +130,10 @@ const SETTINGS_COLUMNS =
    low_balance_threshold, verify_charge_type, verify_charge_percent,
    topup_fee_enabled, topup_fee_percent, key_unlock_fee,
    vendor_activation_fee, vendor_verify_charge_enabled, vendor_verify_charge_type,
-   vendor_verify_charge_amount, vendor_verify_charge_percent, updated_at`;
+   vendor_verify_charge_amount, vendor_verify_charge_percent,
+   merchant_commission_join_enabled, merchant_commission_join_percent,
+   merchant_commission_verify_enabled, merchant_commission_verify_percent,
+   vendor_topup_fee_enabled, vendor_topup_fee_percent, updated_at`;
 
 async function getSettings(req, res, next) {
   try {
@@ -139,6 +148,9 @@ async function getSettings(req, res, next) {
       vendor_activation_fee: 0,
       vendor_verify_charge_enabled: false, vendor_verify_charge_type: 'percent',
       vendor_verify_charge_amount: 0, vendor_verify_charge_percent: 0,
+      merchant_commission_join_enabled: false, merchant_commission_join_percent: 0,
+      merchant_commission_verify_enabled: false, merchant_commission_verify_percent: 0,
+      vendor_topup_fee_enabled: false, vendor_topup_fee_percent: 0,
     } });
   } catch (e) { next(e); }
 }
@@ -210,6 +222,21 @@ async function updateSettings(req, res, next) {
       if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'vendor_verify_charge_percent must be between 0 and 100' });
       patch.vendor_verify_charge_percent = n;
     }
+    if ('vendor_topup_fee_enabled' in patch) patch.vendor_topup_fee_enabled = !!patch.vendor_topup_fee_enabled;
+    if ('vendor_topup_fee_percent' in patch) {
+      const n = Number(patch.vendor_topup_fee_percent);
+      if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'vendor_topup_fee_percent must be between 0 and 100' });
+      patch.vendor_topup_fee_percent = n;
+    }
+    if ('merchant_commission_join_enabled' in patch) patch.merchant_commission_join_enabled = !!patch.merchant_commission_join_enabled;
+    if ('merchant_commission_verify_enabled' in patch) patch.merchant_commission_verify_enabled = !!patch.merchant_commission_verify_enabled;
+    for (const f of ['merchant_commission_join_percent', 'merchant_commission_verify_percent']) {
+      if (f in patch) {
+        const n = Number(patch[f]);
+        if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: `${f} must be between 0 and 100` });
+        patch[f] = n;
+      }
+    }
 
     if (Object.keys(patch).length === 0) {
       return getSettings(req, res, next);
@@ -235,7 +262,8 @@ async function updateSettings(req, res, next) {
 /* ─── Platform revenue / earnings — super-admin income view ─── */
 async function getRevenue(req, res, next) {
   try {
-    const limit = Math.min(200, Number(req.query.limit) || 50);
+    const limit = Math.min(50, Number(req.query.limit) || 10);
+    const offset = Math.max(0, Number(req.query.offset) || 0);
 
     // Totals by source + grand total, plus simple time windows.
     const totals = await pool.query(
@@ -261,7 +289,7 @@ async function getRevenue(req, res, next) {
          FROM platform_revenue r
          LEFT JOIN merchants m ON m.id = r.merchant_id
         ORDER BY r.created_at DESC
-        LIMIT ${limit}`
+        LIMIT ${limit} OFFSET ${offset}`
     );
 
     const t = totals.rows[0];
@@ -274,6 +302,7 @@ async function getRevenue(req, res, next) {
       this_month:       Number(t.this_month),
       entry_count:      t.entry_count,
       recent:           recent.rows,
+      limit, offset,
     });
   } catch (e) { next(e); }
 }

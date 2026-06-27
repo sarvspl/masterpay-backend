@@ -125,7 +125,10 @@ async function getPlatformSettings() {
             topup_fee_enabled, topup_fee_percent, key_unlock_fee,
             vendor_activation_fee,
             vendor_verify_charge_enabled, vendor_verify_charge_type,
-            vendor_verify_charge_amount, vendor_verify_charge_percent
+            vendor_verify_charge_amount, vendor_verify_charge_percent,
+            merchant_commission_join_enabled, merchant_commission_join_percent,
+            merchant_commission_verify_enabled, merchant_commission_verify_percent,
+            vendor_topup_fee_enabled, vendor_topup_fee_percent
        FROM platform_settings WHERE id = 1`
   );
   _settingsCache = r.rows[0] || {
@@ -136,6 +139,9 @@ async function getPlatformSettings() {
     vendor_activation_fee: 0,
     vendor_verify_charge_enabled: false, vendor_verify_charge_type: 'percent',
     vendor_verify_charge_amount: 0, vendor_verify_charge_percent: 0,
+    merchant_commission_join_enabled: false, merchant_commission_join_percent: 0,
+    merchant_commission_verify_enabled: false, merchant_commission_verify_percent: 0,
+    vendor_topup_fee_enabled: false, vendor_topup_fee_percent: 0,
   };
   _settingsCacheAt = now;
   return _settingsCache;
@@ -530,8 +536,15 @@ async function debitVendorVerifyFee(accountId, transactionId, settings, client =
     }
 
     await c.query('UPDATE accounts SET wallet_balance = wallet_balance - $1 WHERE id = $2', [fee, accountId]);
+
+    // Commission split: the merchant earns a % of this fee; the platform keeps
+    // the rest as revenue.
+    const commission = computeMerchantCommission(settings, 'verify', fee);
+    if (commission > 0) {
+      await creditMerchantCommission(c, guard.rows[0].merchant_id, commission, transactionId, 'Vendor verification commission');
+    }
     await recordPlatformRevenue(c, {
-      type: 'verify_fee', amount: fee, currency: settings.verify_charge_currency,
+      type: 'verify_fee', amount: fee - commission, currency: settings.verify_charge_currency,
       merchantId: guard.rows[0].merchant_id, sourceTransactionId: transactionId, note: 'Vendor ' + note,
     });
     if (ownsClient) await c.query('COMMIT');
@@ -544,29 +557,85 @@ async function debitVendorVerifyFee(accountId, transactionId, settings, client =
   }
 }
 
-// Credit a vendor's wallet for a confirmed top-up payment. Idempotent via
-// uniq_vendor_topup_per_transaction. Returns true if it credited.
+// Top-up fee added on top of a vendor recharge (vendor pays credit + fee).
+function computeVendorTopupFee(settings, creditAmount) {
+  if (!settings || !settings.vendor_topup_fee_enabled) return 0;
+  const pct = Number(settings.vendor_topup_fee_percent);
+  const amt = Number(creditAmount);
+  if (!Number.isFinite(pct) || pct <= 0) return 0;
+  if (!Number.isFinite(amt) || amt <= 0) return 0;
+  return Math.round(amt * pct) / 100;
+}
+
+// Credit a vendor's wallet for a confirmed top-up payment. The vendor paid the
+// GROSS (transactions.amount); we credit the NET (vendor_topup_credit_amount,
+// falling back to gross for older rows) and book the difference as the top-up
+// fee (platform revenue). Idempotent via uniq_vendor_topup_per_transaction.
 async function creditVendorTopup(db, transactionId) {
   const t = await db.query(
-    `SELECT t.amount, t.vendor_topup_account_id AS account_id, a.merchant_id
+    `SELECT t.amount, t.vendor_topup_credit_amount, t.vendor_topup_account_id AS account_id, a.merchant_id
        FROM transactions t JOIN accounts a ON a.id = t.vendor_topup_account_id
       WHERE t.id = $1 AND t.vendor_topup_account_id IS NOT NULL`,
     [transactionId]
   );
   if (t.rowCount === 0) return false;
-  const amount = Number(t.rows[0].amount);
-  if (!(amount > 0)) return false;
+  const gross = Number(t.rows[0].amount);
+  const net = t.rows[0].vendor_topup_credit_amount != null ? Number(t.rows[0].vendor_topup_credit_amount) : gross;
+  if (!(net > 0)) return false;
+  const fee = Math.max(0, Math.round((gross - net) * 100) / 100);
   try {
     await db.query(
       `INSERT INTO wallet_ledger (merchant_id, account_id, amount, kind, source_transaction_id, note)
        VALUES ($1, $2, $3, 'vendor_topup', $4, 'Wallet top-up')`,
-      [t.rows[0].merchant_id, t.rows[0].account_id, amount, transactionId]
+      [t.rows[0].merchant_id, t.rows[0].account_id, net, transactionId]
     );
   } catch (e) {
     if (e.code === '23505') return false; // already credited
     throw e;
   }
-  await db.query('UPDATE accounts SET wallet_balance = wallet_balance + $1 WHERE id = $2', [amount, t.rows[0].account_id]);
+  await db.query('UPDATE accounts SET wallet_balance = wallet_balance + $1 WHERE id = $2', [net, t.rows[0].account_id]);
+  if (fee > 0) {
+    const settings = await getPlatformSettings().catch(() => ({ verify_charge_currency: 'BDT' }));
+    await recordPlatformRevenue(db, {
+      type: 'topup_fee', amount: fee, currency: settings.verify_charge_currency || 'BDT',
+      merchantId: t.rows[0].merchant_id, sourceTransactionId: transactionId, note: 'Vendor wallet top-up fee',
+    });
+  }
+  return true;
+}
+
+/* ───────────────────── MERCHANT COMMISSION (revenue share) ─────────────────
+ * Of a fee the platform collects from a merchant's vendor (activation or
+ * per-verification), a configurable % is the MERCHANT's share — credited to
+ * their wallet; the platform keeps the remainder. */
+
+// kind: 'join' | 'verify'. Returns the merchant's share of `feeAmount` (2dp).
+function computeMerchantCommission(settings, kind, feeAmount) {
+  const enabled = kind === 'join' ? settings.merchant_commission_join_enabled : settings.merchant_commission_verify_enabled;
+  const pct = kind === 'join' ? Number(settings.merchant_commission_join_percent) : Number(settings.merchant_commission_verify_percent);
+  if (!enabled || !Number.isFinite(pct) || pct <= 0) return 0;
+  const amt = Number(feeAmount);
+  if (!Number.isFinite(amt) || amt <= 0) return 0;
+  const share = Math.round(amt * pct) / 100; // pct% of fee, 2dp
+  return share > amt ? amt : share;          // never exceed the fee
+}
+
+// Credit a merchant's wallet with a commission. Idempotent per source fee
+// (uniq_commission_per_transaction). Returns true if it credited.
+async function creditMerchantCommission(db, merchantId, amount, sourceTransactionId, note) {
+  const amt = Number(amount);
+  if (!merchantId || !(amt > 0)) return false;
+  try {
+    await db.query(
+      `INSERT INTO wallet_ledger (merchant_id, amount, kind, source_transaction_id, note)
+       VALUES ($1, $2, 'commission', $3, $4)`,
+      [merchantId, amt, sourceTransactionId, note || 'Commission']
+    );
+  } catch (e) {
+    if (e.code === '23505') return false; // already credited
+    throw e;
+  }
+  await db.query('UPDATE merchants SET wallet_balance = wallet_balance + $1, updated_at = NOW() WHERE id = $2', [amt, merchantId]);
   return true;
 }
 
@@ -574,6 +643,9 @@ module.exports = {
   creditWalletIfTopup,
   debitVerifyFee,
   checkWalletSufficient,
+  computeMerchantCommission,
+  creditMerchantCommission,
+  computeVendorTopupFee,
   getWalletStatusForMerchant,
   getPlatformSettings,
   computeVerifyFee,

@@ -32,7 +32,7 @@ async function getWallet(req, res, next) {
            SELECT id, amount, kind, source_session_id, source_transaction_id, note, created_at,
                   SUM(amount) OVER (ORDER BY created_at ASC, id ASC) AS balance_after
              FROM wallet_ledger
-            WHERE merchant_id = $1
+            WHERE merchant_id = $1 AND account_id IS NULL
          ) x
         ORDER BY created_at DESC, id DESC
         LIMIT 50`,
