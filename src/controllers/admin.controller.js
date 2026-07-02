@@ -9,6 +9,7 @@ const {
 } = require('../utils/keys');
 const { generateUniqueUsername } = require('../utils/username');
 const { currencyForCountry } = require('../utils/currency');
+const { COOKIE_NAMES, setSessionCookie, clearSessionCookie } = require('../utils/cookies');
 
 const USERNAME_RE = /^[a-z0-9_]{3,40}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -29,10 +30,18 @@ async function login(req, res, next) {
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
     const token = sign({ sub: rows[0].id, username: rows[0].username, role: 'admin' });
+    setSessionCookie(res, COOKIE_NAMES.admin, token);
     res.json({ token });
   } catch (e) {
     next(e);
   }
+}
+
+// Clear the admin session cookie. No auth required so an expired/invalid
+// session can still be cleared cleanly.
+function logout(req, res) {
+  clearSessionCookie(res, COOKIE_NAMES.admin);
+  res.json({ ok: true });
 }
 
 async function listMerchants(req, res, next) {
@@ -571,7 +580,7 @@ async function updateDevice(req, res, next) {
 }
 
 module.exports = {
-  login, listMerchants, getMerchant, createMerchant,
+  login, logout, listMerchants, getMerchant, createMerchant,
   suspendMerchant, unsuspendMerchant, adjustWallet,
   getMerchantLedger, getMerchantRecharges, resetMerchantPassword,
   updateDevice,

@@ -15,6 +15,7 @@ const { sign } = require('../utils/jwt');
 const { getPlatformSettings, computeVendorTopupFee } = require('../services/wallet');
 const smsCtrl = require('./sms.controller');
 const { settleForTransaction } = require('../services/activation');
+const { COOKIE_NAMES, setSessionCookie, clearSessionCookie } = require('../utils/cookies');
 
 /**
  * Try to auto-confirm a vendor's pending platform payment (activation OR wallet
@@ -153,6 +154,7 @@ async function register(req, res, next) {
     }
 
     const token = sign({ sub: row.id, username: row.username, role: 'vendor' });
+    setSessionCookie(res, COOKIE_NAMES.vendor, token);
     res.status(201).json({ token, vendor: { id: row.id, username: row.username, label: row.label } });
   } catch (e) { next(e); }
 }
@@ -188,8 +190,15 @@ async function login(req, res, next) {
 
     await pool.query('UPDATE accounts SET last_login_at = NOW() WHERE id = $1', [r.rows[0].id]);
     const token = sign({ sub: r.rows[0].id, username: r.rows[0].username, role: 'vendor' });
+    setSessionCookie(res, COOKIE_NAMES.vendor, token);
     res.json({ token });
   } catch (e) { next(e); }
+}
+
+/* ─── POST /api/vendor/logout ─── Clear the session cookie (no auth needed). */
+function logout(req, res) {
+  clearSessionCookie(res, COOKIE_NAMES.vendor);
+  res.json({ ok: true });
 }
 
 /* ─── GET /api/vendor/me ───
@@ -534,4 +543,4 @@ async function submitTopup(req, res, next) {
   }
 }
 
-module.exports = { register, login, me, changePassword, submitActivation, getWallet, submitTopup };
+module.exports = { register, login, logout, me, changePassword, submitActivation, getWallet, submitTopup };

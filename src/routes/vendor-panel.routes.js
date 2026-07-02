@@ -55,6 +55,7 @@ async function ownTxn(req, res, next) {
 /* ── Auth + profile (always open so the pay screen can render) ── */
 router.post('/register',           vendorCtrl.register);
 router.post('/login',              limiters.login, vendorCtrl.login);
+router.post('/logout',             vendorCtrl.logout);
 router.get ('/me',                 requireVendor, vendorCtrl.me);
 router.post('/me/password',        requireVendor, vendorCtrl.changePassword);
 router.post('/activation/submit',  requireVendor, vendorCtrl.submitActivation);

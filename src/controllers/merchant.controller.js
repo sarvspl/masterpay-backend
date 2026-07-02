@@ -9,6 +9,7 @@ const {
 const { generateUniqueUsername, slugify } = require('../utils/username');
 const { currencyForCountry } = require('../utils/currency');
 const { getPlatformSettings, recordPlatformRevenue } = require('../services/wallet');
+const { COOKIE_NAMES, setSessionCookie, clearSessionCookie } = require('../utils/cookies');
 
 const USERNAME_RE = /^[a-z0-9_]{3,40}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -103,6 +104,9 @@ async function register(req, res, next) {
       const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
       const fee = Number(settings.key_unlock_fee || 0);
       const unlocked = fee <= 0;
+      // Carry the real JWT in an httpOnly cookie; the token is still returned in
+      // the body for back-compat but the browser never reads it from there.
+      setSessionCookie(res, COOKIE_NAMES.merchant, token);
       res.status(201).json({
         token,
         merchant: {
@@ -154,10 +158,18 @@ async function login(req, res, next) {
     }
 
     const token = sign({ sub: rows[0].id, username: rows[0].username, role: 'merchant' });
+    setSessionCookie(res, COOKIE_NAMES.merchant, token);
     res.json({ token });
   } catch (e) {
     next(e);
   }
+}
+
+// Clear the session cookie. No auth required so an expired/invalid session can
+// still be cleared cleanly.
+function logout(req, res) {
+  clearSessionCookie(res, COOKIE_NAMES.merchant);
+  res.json({ ok: true });
 }
 
 async function me(req, res, next) {
@@ -429,6 +441,6 @@ async function unlockKeys(req, res, next) {
 }
 
 module.exports = {
-  register, login, me, updateMe, changePassword, checkUsername,
+  register, login, logout, me, updateMe, changePassword, checkUsername,
   listBrands, createBrand, deleteBrand, unlockKeys,
 };

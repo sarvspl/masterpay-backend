@@ -11,6 +11,7 @@ const ticketsCtrl  = require('../controllers/tickets.controller');
 const { limiters } = require('../middleware/rateLimit');
 
 router.post('/login', limiters.login, ctrl.login);
+router.post('/logout', ctrl.logout);
 router.get('/merchants', requireAdmin, ctrl.listMerchants);
 router.get('/merchants/:id', requireAdmin, ctrl.getMerchant);
 router.post('/merchants', requireAdmin, ctrl.createMerchant);

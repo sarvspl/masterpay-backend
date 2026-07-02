@@ -14,6 +14,7 @@ const router = express.Router();
 
 router.post('/register', ctrl.register);
 router.post('/login', limiters.login, ctrl.login);
+router.post('/logout', ctrl.logout);
 router.get('/check-username', ctrl.checkUsername);
 router.get('/me', requireMerchant, ctrl.me);
 router.post('/keys/unlock', requireMerchant, ctrl.unlockKeys);

@@ -16,7 +16,18 @@ const { notFound, errorHandler } = require('./middleware/error');
 
 const app = express();
 
-app.use(cors());
+// Cookies require credentialed CORS, which forbids the `*` origin — so we must
+// echo a specific allowed origin. By default we reflect the request's Origin
+// (fine when the API is only reachable by our own frontends); set CORS_ORIGINS
+// to a comma-separated allowlist to lock it down (e.g. https://masterpay.it.com).
+const corsAllowlist = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+app.use(cors({
+  origin: corsAllowlist.length ? corsAllowlist : true,
+  credentials: true,
+}));
 
 // Body parsing: keep the global limit tight at 1 MB, but allow the checkout
 // submit endpoint up to 8 MB so it can carry a base64 payment screenshot.

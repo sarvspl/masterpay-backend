@@ -1,14 +1,21 @@
 const { verify } = require('../utils/jwt');
 const pool = require('../db/pool');
+const { COOKIE_NAMES, readCookie } = require('../utils/cookies');
 
-function extractToken(req) {
+// Prefer the httpOnly session cookie (set at login), then fall back to the
+// `Authorization: Bearer` header so non-browser API clients still work.
+function extractToken(req, cookieName) {
+  if (cookieName) {
+    const fromCookie = readCookie(req, cookieName);
+    if (fromCookie) return fromCookie;
+  }
   const header = req.headers.authorization || '';
   if (header.startsWith('Bearer ')) return header.slice(7);
   return null;
 }
 
 async function requireMerchant(req, res, next) {
-  const token = extractToken(req);
+  const token = extractToken(req, COOKIE_NAMES.merchant);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
     const payload = verify(token);
@@ -41,7 +48,7 @@ async function requireMerchant(req, res, next) {
 }
 
 async function requireVendor(req, res, next) {
-  const token = extractToken(req);
+  const token = extractToken(req, COOKIE_NAMES.vendor);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
     const payload = verify(token);
@@ -107,7 +114,7 @@ function requireActivated(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  const token = extractToken(req);
+  const token = extractToken(req, COOKIE_NAMES.admin);
   if (!token) return res.status(401).json({ error: 'Missing token' });
   try {
     const payload = verify(token);
