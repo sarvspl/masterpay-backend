@@ -20,13 +20,13 @@ function generateSecretKey() {
   return `sk_live_${randomHex(24)}`;
 }
 
-// Length of the random part of a device auth key. Kept at 24 so the key carries
-// ~10^36 combinations (32^24) — guessing is physically infeasible. Old 6-char
-// keys still work (lookups are exact-match); merchants/vendors upgrade by
-// regenerating. Only this generator changed; the app and UI look identical bar
-// the extra length, and the DB has a UNIQUE constraint so callers retry on the
-// astronomically rare collision.
-const DEVICE_KEY_RANDOM_LEN = 24;
+// Length of the random part of a device auth key. Set to 350 so every key is at
+// least 350 characters (plus the "PV-" prefix → 353 total). That's an enormous
+// keyspace (33^350) — guessing is physically impossible. The columns that store
+// the key are TEXT (see migration 035), and old shorter keys still work because
+// lookups are exact-match; merchants/vendors upgrade by regenerating. The DB
+// UNIQUE constraint means callers retry on the (astronomically rare) collision.
+const DEVICE_KEY_RANDOM_LEN = 350;
 
 function generateDeviceAuthKey() {
   return `PV-${randomAlphaNumUpper(DEVICE_KEY_RANDOM_LEN)}`;
