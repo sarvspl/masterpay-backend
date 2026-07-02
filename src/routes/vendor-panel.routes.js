@@ -75,6 +75,7 @@ router.delete('/gateways/:id',        requireVendor, requireActivated, asMerchan
 
 /* ── Devices (the phones bound to this vendor) ── */
 router.get('/devices', requireVendor, requireActivated, asMerchant, scopeAccountQuery, deviceCtrl.listForMerchant);
+router.post('/device-key/regenerate', requireVendor, requireActivated, vendorCtrl.regenerateDeviceKey);
 
 /* ── Wallet (balance, ledger, top-up) ── */
 router.get ('/wallet',        requireVendor, requireActivated, vendorCtrl.getWallet);

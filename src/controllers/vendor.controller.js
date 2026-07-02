@@ -16,6 +16,7 @@ const { getPlatformSettings, computeVendorTopupFee } = require('../services/wall
 const smsCtrl = require('./sms.controller');
 const { settleForTransaction } = require('../services/activation');
 const { COOKIE_NAMES, setSessionCookie, clearSessionCookie } = require('../utils/cookies');
+const { generateDeviceAuthKey } = require('../utils/keys');
 
 /**
  * Try to auto-confirm a vendor's pending platform payment (activation OR wallet
@@ -543,4 +544,50 @@ async function submitTopup(req, res, next) {
   }
 }
 
-module.exports = { register, login, logout, me, changePassword, submitActivation, getWallet, submitTopup };
+/* ─── POST /api/vendor/device-key/regenerate ───
+ * A vendor rotates their OWN device key to a fresh long one (C4). Any phone
+ * bound with the old key is soft-unbound; the vendor re-enters the new key in
+ * the app to reconnect.
+ */
+async function regenerateDeviceKey(req, res, next) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Lock the vendor's own account row.
+    const a = await client.query(
+      'SELECT id, keys_unlocked FROM accounts WHERE id = $1 FOR UPDATE',
+      [req.vendor.account_id]
+    );
+    if (a.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Account not found' }); }
+
+    let newKey;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const candidate = generateDeviceAuthKey();
+        await client.query('UPDATE accounts SET device_auth_key = $1 WHERE id = $2', [candidate, req.vendor.account_id]);
+        newKey = candidate;
+        break;
+      } catch (e) {
+        if (e.code === '23505' && attempt < 4) continue;
+        throw e;
+      }
+    }
+
+    const unbound = await client.query(
+      `UPDATE devices SET unbound_at = NOW()
+        WHERE account_id = $1 AND unbound_at IS NULL
+        RETURNING id`,
+      [req.vendor.account_id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ device_auth_key: newKey, disconnected: unbound.rowCount });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { register, login, logout, me, changePassword, submitActivation, getWallet, submitTopup, regenerateDeviceKey };

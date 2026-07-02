@@ -342,4 +342,75 @@ async function activate(req, res, next) {
   }
 }
 
-module.exports = { list, create, unlock, remove, extraAccountFee, setActivationFee, activate };
+/* ─── POST /api/merchant/accounts/:id/regenerate-key ───
+ * Replace an account's device_auth_key with a fresh long one (C4: upgrade an
+ * old short key to a strong 20+ char key). Only for accounts the merchant owns
+ * directly (Primary + non-vendor); vendor-owned accounts are managed by the
+ * vendor from their own panel. The account must be unlocked (otherwise the
+ * merchant can't see the key anyway). Any phone bound with the old key is
+ * soft-unbound so the dashboard shows it disconnected — the merchant re-enters
+ * the new key in the app to reconnect.
+ */
+async function regenerateDeviceKey(req, res, next) {
+  const client = await pool.connect();
+  try {
+    const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
+    const gateDisabled = Number(settings.key_unlock_fee || 0) <= 0;
+
+    await client.query('BEGIN');
+    const a = await client.query(
+      `SELECT id, is_default, keys_unlocked, external_id, username
+         FROM accounts
+        WHERE id = $1 AND merchant_id = $2
+        FOR UPDATE`,
+      [req.params.id, req.merchant.id]
+    );
+    if (a.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Account not found' }); }
+    const acc = a.rows[0];
+
+    // Vendor-owned account → the vendor rotates their own key, not the operator.
+    const isVendor = !acc.is_default && (acc.external_id != null || acc.username != null);
+    if (isVendor) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'This is a vendor account. The vendor regenerates their own key from their panel.', code: 'vendor_owned' });
+    }
+
+    if (!acc.keys_unlocked && !gateDisabled) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Unlock this account before regenerating its device key.', code: 'locked' });
+    }
+
+    // Mint a unique new key (retry on the rare UNIQUE collision).
+    let newKey;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const candidate = generateDeviceAuthKey();
+        await client.query('UPDATE accounts SET device_auth_key = $1 WHERE id = $2', [candidate, acc.id]);
+        newKey = candidate;
+        break;
+      } catch (e) {
+        if (e.code === '23505' && attempt < 4) continue;
+        throw e;
+      }
+    }
+
+    // Soft-unbind the phones on this account: their stored (old) key no longer
+    // matches, so they'd 401 anyway — reflect that in the UI.
+    const unbound = await client.query(
+      `UPDATE devices SET unbound_at = NOW()
+        WHERE account_id = $1 AND unbound_at IS NULL
+        RETURNING id`,
+      [acc.id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ device_auth_key: newKey, disconnected: unbound.rowCount });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { list, create, unlock, remove, extraAccountFee, setActivationFee, activate, regenerateDeviceKey };

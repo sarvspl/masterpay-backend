@@ -34,8 +34,9 @@ router.post  ('/accounts',            requireMerchant, (req, res) => res.status(
   error: 'Creating accounts from the dashboard is disabled. Vendors are provisioned through the marketplace API (POST /api/vendors).',
   code: 'account_create_disabled',
 }));
-router.post  ('/accounts/:id/unlock',   requireMerchant, accountsCtrl.unlock);
-router.delete('/accounts/:id',          requireMerchant, accountsCtrl.remove);
+router.post  ('/accounts/:id/unlock',        requireMerchant, accountsCtrl.unlock);
+router.post  ('/accounts/:id/regenerate-key', requireMerchant, accountsCtrl.regenerateDeviceKey);
+router.delete('/accounts/:id',               requireMerchant, accountsCtrl.remove);
 
 router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
 router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);

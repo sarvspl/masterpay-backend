@@ -12,13 +12,17 @@ const router = express.Router();
 // or disconnect their phone even if they're broke. Every other operation
 // (heartbeat / poll / sms / report / verify / transactions) requires the
 // merchant to have at least the per-verification fee in their wallet.
-router.post('/bind',         ctrl.bind);
-router.post('/unbind',       ctrl.unbind);
-router.post('/heartbeat',    guardDevice, ctrl.heartbeat);
-router.post('/poll',         guardDevice, ctrl.poll);
-router.post('/report',       guardDevice, ctrl.report);
-router.post('/sms',          limiters.deviceSms, guardDevice, smsCtrl.upload);
-router.post('/transactions', guardDevice, ctrl.listTransactionsForDevice);
-router.post('/verify',       guardDevice, ctrl.verifyTxnIdFromDevice);
+// deviceBruteforce (per-IP, counts only 401=bad-key responses) fronts every
+// key-authenticated endpoint so a guessing script is throttled while legit
+// phones — which always authenticate — are never affected.
+const bf = limiters.deviceBruteforce;
+router.post('/bind',         bf, ctrl.bind);
+router.post('/unbind',       bf, ctrl.unbind);
+router.post('/heartbeat',    bf, guardDevice, ctrl.heartbeat);
+router.post('/poll',         bf, guardDevice, ctrl.poll);
+router.post('/report',       bf, guardDevice, ctrl.report);
+router.post('/sms',          bf, limiters.deviceSms, guardDevice, smsCtrl.upload);
+router.post('/transactions', bf, guardDevice, ctrl.listTransactionsForDevice);
+router.post('/verify',       bf, guardDevice, ctrl.verifyTxnIdFromDevice);
 
 module.exports = router;

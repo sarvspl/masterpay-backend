@@ -20,8 +20,16 @@ function generateSecretKey() {
   return `sk_live_${randomHex(24)}`;
 }
 
+// Length of the random part of a device auth key. Kept at 24 so the key carries
+// ~10^36 combinations (32^24) — guessing is physically infeasible. Old 6-char
+// keys still work (lookups are exact-match); merchants/vendors upgrade by
+// regenerating. Only this generator changed; the app and UI look identical bar
+// the extra length, and the DB has a UNIQUE constraint so callers retry on the
+// astronomically rare collision.
+const DEVICE_KEY_RANDOM_LEN = 24;
+
 function generateDeviceAuthKey() {
-  return `PV-${randomAlphaNumUpper(6)}`;
+  return `PV-${randomAlphaNumUpper(DEVICE_KEY_RANDOM_LEN)}`;
 }
 
 function maskKey(key, visible = 4) {
