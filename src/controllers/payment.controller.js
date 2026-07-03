@@ -294,15 +294,21 @@ async function submitTxn(req, res, next) {
     // Response shape mirrors walletGuard.rejectCustomerSafe so the customer
     // sees a neutral message even if the merchant's integration renders the
     // raw JSON.
-    const { checkWalletSufficient } = require('../services/wallet');
-    const wallet = await checkWalletSufficient(s.merchant_id);
+    // Wallet gate. For a vendor-scoped session the VENDOR pays the fee, so gate
+    // on the vendor's wallet (at the exact fee for this amount); otherwise the
+    // merchant's.
+    const { checkWalletSufficient, checkVendorWalletSufficient } = require('../services/wallet');
+    const wallet = s.account_id
+      ? await checkVendorWalletSufficient(s.account_id, Number(s.amount))
+      : await checkWalletSufficient(s.merchant_id);
     if (!wallet.ok) {
       return res.status(402).json({
         error: 'Services currently unavailable.',
-        merchant_message:
-          'Merchant wallet has insufficient balance to cover the per-verification fee. Top up at the dashboard.',
+        merchant_message: s.account_id
+          ? 'The vendor’s wallet has insufficient balance to cover the per-verification fee.'
+          : 'Merchant wallet has insufficient balance to cover the per-verification fee. Top up at the dashboard.',
         insufficient_balance: true,
-        code: 'merchant_wallet_empty',
+        code: s.account_id ? 'vendor_wallet_empty' : 'merchant_wallet_empty',
       });
     }
 
@@ -726,19 +732,31 @@ async function manualResolve(req, res, next) {
     const reason = req.body.reason ? String(req.body.reason).slice(0, 240) : null;
 
     // Wallet gate — only for `success` resolution (debit fires). Marking
-    // failed is free and stays allowed at any balance. Without this check, a
-    // merchant at zero balance clicking Mark Paid would silently push their
-    // wallet negative via the debit hook.
+    // failed is free and stays allowed at any balance. For a transaction on a
+    // VENDOR account the vendor pays the fee, so gate on the vendor's wallet;
+    // otherwise the merchant's. This blocks a manual approve when the payer
+    // can't cover the per-verification fee (no free verifications).
     if (result === 'success') {
-      const { checkWalletSufficient } = require('../services/wallet');
-      const wallet = await checkWalletSufficient(req.merchant.id);
+      const { checkWalletSufficient, checkVendorWalletSufficient } = require('../services/wallet');
+      const acc = await pool.query(
+        `SELECT a.id AS account_id, a.is_default, a.external_id, a.username, t.amount
+           FROM transactions t JOIN gateways g ON g.id = t.gateway_id JOIN accounts a ON a.id = g.account_id
+          WHERE t.id = $1 AND t.merchant_id = $2`,
+        [req.params.id, req.merchant.id]
+      );
+      const isVendorTx = acc.rowCount > 0 && !acc.rows[0].is_default && (acc.rows[0].external_id != null || acc.rows[0].username != null);
+      const wallet = isVendorTx
+        ? await checkVendorWalletSufficient(acc.rows[0].account_id, Number(acc.rows[0].amount))
+        : await checkWalletSufficient(req.merchant.id);
       if (!wallet.ok) {
         return res.status(402).json({
-          error: 'Top up your wallet to resolve pending verifications.',
+          error: isVendorTx
+            ? 'This vendor’s wallet is too low to confirm this payment. Ask them to top up first.'
+            : 'Top up your wallet to resolve pending verifications.',
           merchant_message:
-            'Marking a verification as Paid debits the per-verification fee, but the wallet balance is below the configured fee. Top up first, then retry.',
+            'Confirming a verification debits the per-verification fee, but the payer’s wallet balance is below the fee. Top up first, then retry.',
           insufficient_balance: true,
-          code: 'merchant_wallet_empty',
+          code: isVendorTx ? 'vendor_wallet_empty' : 'merchant_wallet_empty',
         });
       }
     }

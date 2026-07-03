@@ -233,7 +233,7 @@ async function me(req, res, next) {
 
     const a = await pool.query(
       `SELECT a.id, a.label, a.username, a.is_default, a.keys_unlocked, a.device_auth_key,
-              a.created_at, a.last_login_at,
+              a.created_at, a.last_login_at, a.wallet_balance,
               m.name AS merchant_name, m.currency
          FROM accounts a
          JOIN merchants m ON m.id = a.merchant_id
@@ -244,6 +244,16 @@ async function me(req, res, next) {
     const acc = a.rows[0];
 
     const visible = await keyVisible(acc.keys_unlocked);
+
+    // Wallet + per-verification charge state, so the panel can warn on low
+    // balance and hide "Approve" when the vendor can't cover the fee.
+    const settings = await getPlatformSettings().catch(() => ({}));
+    const chargeType = settings.vendor_verify_charge_type || 'percent';
+    const verifyCharging = !!settings.vendor_verify_charge_enabled && (
+      chargeType === 'percent' ? Number(settings.vendor_verify_charge_percent) > 0 : Number(settings.vendor_verify_charge_amount) > 0
+    );
+    const threshold = Number(settings.low_balance_threshold || 0);
+    const walletBalance = Number(acc.wallet_balance || 0);
 
     // Successful-verification count + sum on this vendor's gateways, for the
     // requested window (mirrors the merchant accounts stats).
@@ -305,6 +315,13 @@ async function me(req, res, next) {
         txn_count:       stats.rows[0].txn_count,
         txn_total:       Number(stats.rows[0].txn_total),
         pending_count:   stats.rows[0].pending_count,
+        // Wallet + per-verification charge (for low-balance warnings + hiding Approve)
+        wallet_balance:        walletBalance,
+        verify_charging:       verifyCharging,
+        verify_charge_type:    chargeType,
+        verify_charge_percent: Number(settings.vendor_verify_charge_percent || 0),
+        verify_charge_amount:  Number(settings.vendor_verify_charge_amount || 0),
+        low_balance:           verifyCharging && walletBalance < threshold,
         // Activation paywall
         needs_activation:   req.vendor.needs_activation,
         activation_fee:     req.vendor.activation_fee,

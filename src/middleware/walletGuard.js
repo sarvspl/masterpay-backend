@@ -60,7 +60,10 @@ async function guardMerchant(req, res, next) {
         [vendorId, merchantId]
       );
       if (a.rowCount > 0) {
-        const check = await checkVendorWalletSufficient(vendorId);
+        // Gate on the EXACT fee for this payment amount — a vendor whose balance
+        // can't cover the per-verification fee can't take the payment at all.
+        const amt = Number(req.body && req.body.amount);
+        const check = await checkVendorWalletSufficient(vendorId, Number.isFinite(amt) ? amt : null);
         if (!check.ok) return rejectCustomerSafe(res);
         return next();
       }
