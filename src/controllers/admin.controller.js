@@ -156,6 +156,37 @@ async function getMerchant(req, res, next) {
       [req.params.id]
     );
 
+    // Vendors = this merchant's non-Primary accounts, with headline status so
+    // the admin can review the marketplace's sellers.
+    const vendorsRes = await pool.query(
+      `SELECT a.id, a.label, a.username, a.external_id, a.activated_at, a.wallet_balance, a.created_at,
+              (SELECT COUNT(*)::int FROM gateways g WHERE g.account_id = a.id AND g.is_enabled = TRUE)                                   AS gateway_count,
+              (SELECT COUNT(*)::int FROM devices dv WHERE dv.account_id = a.id AND dv.unbound_at IS NULL)                                AS device_count,
+              (SELECT COUNT(*)::int      FROM transactions t JOIN gateways g2 ON g2.id = t.gateway_id WHERE g2.account_id = a.id AND t.status = 'success') AS txn_count,
+              (SELECT COALESCE(SUM(t.amount),0)::numeric FROM transactions t JOIN gateways g2 ON g2.id = t.gateway_id WHERE g2.account_id = a.id AND t.status = 'success') AS txn_total,
+              (SELECT COUNT(*)::int FROM transactions t WHERE (t.activation_account_id = a.id OR t.vendor_topup_account_id = a.id) AND t.status = 'pending') AS pending_payments
+         FROM accounts a
+        WHERE a.merchant_id = $1 AND a.is_default = FALSE
+        ORDER BY a.created_at ASC`,
+      [req.params.id]
+    );
+    const vendors = vendorsRes.rows.map((v) => ({
+      id: v.id,
+      label: v.label,
+      username: v.username,
+      external_id: v.external_id,
+      has_login: v.username != null,
+      is_activated: v.activated_at != null,
+      activated_at: v.activated_at,
+      wallet_balance: Number(v.wallet_balance || 0),
+      gateway_count: v.gateway_count,
+      device_count: v.device_count,
+      txn_count: v.txn_count,
+      txn_total: Number(v.txn_total || 0),
+      pending_payments: v.pending_payments,
+      created_at: v.created_at,
+    }));
+
     res.json({
       merchant: {
         ...r,
@@ -165,6 +196,7 @@ async function getMerchant(req, res, next) {
         device_auth_key: undefined,
         brands,
         devices: devicesRes.rows,
+        vendors,
       },
     });
   } catch (e) {
