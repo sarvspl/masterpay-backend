@@ -15,6 +15,18 @@ const { sign } = require('../utils/jwt');
 const { getPlatformSettings, computeVendorTopupFee } = require('../services/wallet');
 const smsCtrl = require('./sms.controller');
 const { settleForTransaction } = require('../services/activation');
+const { generateSessionId } = require('../utils/session');
+
+// The platform's receiving merchant + its default brand, used as the target for
+// vendor activation / top-up checkout sessions.
+async function platformSessionTarget() {
+  const r = await pool.query(
+    `SELECT m.id AS merchant_id, m.currency, b.id AS brand_id
+       FROM merchants m JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
+      WHERE m.is_platform = TRUE LIMIT 1`
+  );
+  return r.rows[0] || null;
+}
 const { COOKIE_NAMES, setSessionCookie, clearSessionCookie } = require('../utils/cookies');
 const { generateDeviceAuthKey } = require('../utils/keys');
 
@@ -590,4 +602,74 @@ async function regenerateDeviceKey(req, res, next) {
   }
 }
 
-module.exports = { register, login, logout, me, changePassword, submitActivation, getWallet, submitTopup, regenerateDeviceKey };
+/* ─── POST /api/vendor/activation/checkout ───
+ * Creates a hosted-checkout session for the activation fee, routed to the
+ * platform and tagged so that on payment success the vendor is activated.
+ * Returns { checkout_url } — the panel redirects the vendor there.
+ */
+async function activationCheckout(req, res, next) {
+  try {
+    if (!req.vendor.needs_activation) return res.status(400).json({ error: 'Your account is already activated.' });
+    const fee = Number(req.vendor.activation_fee);
+    if (!(fee > 0)) return res.status(400).json({ error: 'No activation fee is configured.' });
+    const target = await platformSessionTarget();
+    if (!target) return res.status(409).json({ error: 'Activation is temporarily unavailable — the platform has no receiving account configured.' });
+
+    const base = process.env.PUBLIC_CHECKOUT_BASE_URL || 'http://localhost:3000';
+
+    // Idempotent: reuse a still-live pending activation session for this vendor.
+    const existing = await pool.query(
+      `SELECT id FROM payment_sessions
+        WHERE merchant_id = $1 AND status = 'pending' AND expires_at > NOW()
+          AND metadata->>'type' = 'vendor_activation' AND metadata->>'account_id' = $2
+        ORDER BY created_at DESC LIMIT 1`,
+      [target.merchant_id, req.vendor.account_id]
+    );
+    if (existing.rowCount > 0) {
+      return res.json({ session_id: existing.rows[0].id, checkout_url: `${base}/pay/${existing.rows[0].id}` });
+    }
+
+    const id = generateSessionId();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO payment_sessions (id, merchant_id, brand_id, account_id, order_id, amount, currency, redirect_url, metadata, expires_at)
+       VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9)`,
+      [id, target.merchant_id, target.brand_id, 'vact_' + req.vendor.account_id + '_' + Date.now(),
+       fee, target.currency || 'BDT', `${base}/vendor/dashboard`,
+       { type: 'vendor_activation', account_id: req.vendor.account_id }, expiresAt]
+    );
+    res.status(201).json({ session_id: id, checkout_url: `${base}/pay/${id}` });
+  } catch (e) { next(e); }
+}
+
+/* ─── POST /api/vendor/wallet/topup/checkout ───
+ * Body: { amount } (the NET to credit). Creates a hosted-checkout session for
+ * the GROSS (amount + top-up fee), tagged so the wallet is credited on success.
+ */
+async function topupCheckout(req, res, next) {
+  try {
+    const amount = Number(req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'Enter a valid top-up amount' });
+    const target = await platformSessionTarget();
+    if (!target) return res.status(409).json({ error: 'Top-up is temporarily unavailable — the platform has no receiving account configured.' });
+
+    const settings = await getPlatformSettings().catch(() => ({}));
+    const net = Math.round(amount * 100) / 100;
+    const fee = computeVendorTopupFee(settings, net);
+    const gross = Math.round((net + fee) * 100) / 100;
+
+    const base = process.env.PUBLIC_CHECKOUT_BASE_URL || 'http://localhost:3000';
+    const id = generateSessionId();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO payment_sessions (id, merchant_id, brand_id, account_id, order_id, amount, currency, redirect_url, metadata, expires_at)
+       VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9)`,
+      [id, target.merchant_id, target.brand_id, 'vtop_' + req.vendor.account_id + '_' + Date.now(),
+       gross, target.currency || 'BDT', `${base}/vendor/dashboard/wallet`,
+       { type: 'vendor_topup', account_id: req.vendor.account_id, credit_amount: net }, expiresAt]
+    );
+    res.status(201).json({ session_id: id, checkout_url: `${base}/pay/${id}` });
+  } catch (e) { next(e); }
+}
+
+module.exports = { register, login, logout, me, changePassword, submitActivation, getWallet, submitTopup, regenerateDeviceKey, activationCheckout, topupCheckout };

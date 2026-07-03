@@ -390,6 +390,8 @@ async function report(req, res, next) {
         const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
         await creditWalletIfTopup(upd.rows[0].session_id)
           .catch((e) => console.error('[wallet] credit failed (apk report):', e.message));
+        await require('../services/activation').settleForTransaction(pool, upd.rows[0].id)
+          .catch((e) => console.error('[settle] failed (apk report):', e.message));
         await debitVerifyFee(m.rows[0].merchant_id, upd.rows[0].id, upd.rows[0].session_id)
           .catch((e) => console.error('[wallet] debit failed (apk report):', e.message));
       }

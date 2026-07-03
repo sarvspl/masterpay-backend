@@ -191,7 +191,7 @@ async function loadSession(sessionId) {
   const r = await pool.query(
     `SELECT s.id, s.amount, s.currency, s.order_id, s.customer_phone, s.customer_name,
             s.redirect_url, s.status, s.expires_at, s.created_at,
-            s.merchant_id, s.brand_id, s.account_id,
+            s.merchant_id, s.brand_id, s.account_id, s.metadata,
             m.name AS merchant_name,
             b.name AS brand_name, b.domain AS brand_domain
        FROM payment_sessions s
@@ -336,6 +336,15 @@ async function submitTxn(req, res, next) {
       return res.status(400).json({ error: 'Invalid gateway for this vendor' });
     }
 
+    // Vendor activation / wallet top-up paid through the hosted checkout: the
+    // session metadata tags which vendor to settle. We stamp the transaction so
+    // the existing settle hook (settleForTransaction) activates / credits on
+    // success, and the admin's Vendor-payments queue picks it up.
+    const _sm = s.metadata || {};
+    const vActivationAcct = _sm.type === 'vendor_activation' ? (_sm.account_id || null) : null;
+    const vTopupAcct      = _sm.type === 'vendor_topup'      ? (_sm.account_id || null) : null;
+    const vTopupCredit    = _sm.type === 'vendor_topup'      ? (_sm.credit_amount ?? null) : null;
+
     /* ─── Session-lock: one Verify per session ─── */
     //
     //   Once a TxnID has been submitted for this session, the method is locked
@@ -430,16 +439,20 @@ async function submitTxn(req, res, next) {
         const upd = await pool.query(
           `UPDATE transactions
               SET session_id = $1, brand_id = $2, customer_phone = COALESCE(customer_phone, $3),
-                  sender_account = $5, proof_image_url = $6, updated_at = NOW()
+                  sender_account = $5, proof_image_url = $6, updated_at = NOW(),
+                  activation_account_id = COALESCE(activation_account_id, $7),
+                  vendor_topup_account_id = COALESCE(vendor_topup_account_id, $8),
+                  vendor_topup_credit_amount = COALESCE(vendor_topup_credit_amount, $9)
             WHERE id = $4
             RETURNING id, status, created_at`,
-          [s.id, s.brand_id, s.customer_phone, inbound.rows[0].id, sender_account, proof_image_url]
+          [s.id, s.brand_id, s.customer_phone, inbound.rows[0].id, sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit]
         );
         await pool.query(
           `UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1 AND status='pending'`,
           [s.id]
         );
         await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (inbound claim):', e.message));
+        await require('../services/activation').settleForTransaction(pool, upd.rows[0].id).catch((e) => console.error('[settle] failed (inbound claim):', e.message));
         await debitVerifyFee(s.merchant_id, upd.rows[0].id, s.id).catch((e) => console.error('[wallet] debit failed (inbound claim):', e.message));
         return res.status(200).json({ transaction: upd.rows[0], auto_matched: 'inbound' });
       }
@@ -481,11 +494,11 @@ async function submitTxn(req, res, next) {
         `INSERT INTO transactions
            (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
             status, result_source, matched_sms, verified_at, payer_name, payer_phone,
-            sender_account, proof_image_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10,$11,$12)
+            sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10,$11,$12,$13,$14,$15)
          RETURNING id, status, created_at`,
         [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, total, s.customer_phone,
-         sms.body, payer.name, payer.phone, sender_account, proof_image_url]
+         sms.body, payer.name, payer.phone, sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit]
       );
       await pool.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [ins.rows[0].id, sms.id]);
       await pool.query(
@@ -493,6 +506,7 @@ async function submitTxn(req, res, next) {
         [s.id]
       );
       await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (late sms):', e.message));
+      await require('../services/activation').settleForTransaction(pool, ins.rows[0].id).catch((e) => console.error('[settle] failed (late sms):', e.message));
       await debitVerifyFee(s.merchant_id, ins.rows[0].id, s.id).catch((e) => console.error('[wallet] debit failed (late sms):', e.message));
       return res.status(200).json({ transaction: ins.rows[0], auto_matched: 'sms' });
     }
@@ -505,11 +519,11 @@ async function submitTxn(req, res, next) {
     const r = await pool.query(
       `INSERT INTO transactions
          (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
-          sender_account, proof_image_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        RETURNING id, status, created_at`,
       [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, totalD, s.customer_phone,
-       sender_account, proof_image_url]
+       sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit]
     );
 
     // Fire-and-forget — never block the customer's response on push delivery.
@@ -566,6 +580,7 @@ async function checkoutStatus(req, res, next) {
       await pool.query(`UPDATE payment_sessions SET status='success', updated_at=NOW() WHERE id=$1`, [s.id]);
       sessionStatus = 'success';
       await creditWalletIfTopup(s.id).catch((e) => console.error('[wallet] credit failed (status promo):', e.message));
+      await require('../services/activation').settleForTransaction(pool, lastTx.id).catch((e) => console.error('[settle] failed (status promo):', e.message));
       await debitVerifyFee(s.merchant_id, lastTx.id, s.id).catch((e) => console.error('[wallet] debit failed (status promo):', e.message));
     }
 

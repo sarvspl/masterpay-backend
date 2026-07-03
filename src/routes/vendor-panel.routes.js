@@ -58,7 +58,8 @@ router.post('/login',              limiters.login, vendorCtrl.login);
 router.post('/logout',             vendorCtrl.logout);
 router.get ('/me',                 requireVendor, vendorCtrl.me);
 router.post('/me/password',        requireVendor, vendorCtrl.changePassword);
-router.post('/activation/submit',  requireVendor, vendorCtrl.submitActivation);
+router.post('/activation/submit',   requireVendor, vendorCtrl.submitActivation);
+router.post('/activation/checkout', requireVendor, vendorCtrl.activationCheckout);
 
 /* ── Everything below requires an ACTIVATED vendor ── */
 
@@ -78,7 +79,8 @@ router.get('/devices', requireVendor, requireActivated, asMerchant, scopeAccount
 router.post('/device-key/regenerate', requireVendor, requireActivated, vendorCtrl.regenerateDeviceKey);
 
 /* ── Wallet (balance, ledger, top-up) ── */
-router.get ('/wallet',        requireVendor, requireActivated, vendorCtrl.getWallet);
-router.post('/wallet/topup',  requireVendor, requireActivated, vendorCtrl.submitTopup);
+router.get ('/wallet',            requireVendor, requireActivated, vendorCtrl.getWallet);
+router.post('/wallet/topup',      requireVendor, requireActivated, vendorCtrl.submitTopup);
+router.post('/wallet/topup/checkout', requireVendor, requireActivated, vendorCtrl.topupCheckout);
 
 module.exports = router;
