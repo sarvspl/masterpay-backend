@@ -781,12 +781,22 @@ async function manualResolve(req, res, next) {
     }
     const reason = req.body.reason ? String(req.body.reason).slice(0, 240) : null;
 
-    // Wallet gate — only for `success` resolution (debit fires). Marking
-    // failed is free and stays allowed at any balance. For a transaction on a
-    // VENDOR account the vendor pays the fee, so gate on the vendor's wallet;
-    // otherwise the merchant's. This blocks a manual approve when the payer
-    // can't cover the per-verification fee (no free verifications).
-    if (result === 'success') {
+    // Wallet gate — applies to BOTH outcomes, not just `success`.
+    //
+    // Approving debits the per-verification fee, so an empty wallet plainly
+    // can't approve. Rejecting debits nothing, but it is gated too: otherwise
+    // an unfunded vendor sits at a zero balance indefinitely, rejecting every
+    // real payment their customers make, and the pending queue becomes a way to
+    // operate the panel without ever topping up. Resolving a payment *at all*
+    // is the paid action.
+    //
+    // Nothing is lost when this fires: the payment stays `pending`, exactly
+    // where it already was, and the bound phone can still auto-resolve it.
+    //
+    // On a VENDOR account the vendor pays the fee, so gate on the vendor's
+    // wallet; otherwise the merchant's. When the platform isn't charging at
+    // all, both helpers return ok and this whole block is a no-op.
+    {
       const { checkWalletSufficient, checkVendorWalletSufficient } = require('../services/wallet');
       const acc = await pool.query(
         `SELECT a.id AS account_id, a.is_default, a.external_id, a.username, t.amount
@@ -799,12 +809,19 @@ async function manualResolve(req, res, next) {
         ? await checkVendorWalletSufficient(acc.rows[0].account_id, Number(acc.rows[0].amount))
         : await checkWalletSufficient(req.merchant.id);
       if (!wallet.ok) {
+        const verb = result === 'success' ? 'confirm' : 'reject';
+        // `req.vendor` is set only on the vendor-panel route, i.e. the vendor is
+        // reading this about their own wallet. Anyone else is reading about
+        // somebody else's, so don't tell a vendor to "ask them to top up".
+        const selfService = !!req.vendor;
         return res.status(402).json({
           error: isVendorTx
-            ? 'This vendor’s wallet is too low to confirm this payment. Ask them to top up first.'
-            : 'Top up your wallet to resolve pending verifications.',
+            ? (selfService
+                ? `Your wallet is too low to ${verb} this payment. Top up first.`
+                : `This vendor’s wallet is too low to ${verb} this payment. Ask them to top up first.`)
+            : `Top up your wallet to ${verb} pending verifications.`,
           merchant_message:
-            'Confirming a verification debits the per-verification fee, but the payer’s wallet balance is below the fee. Top up first, then retry.',
+            'Resolving a verification requires at least the per-verification fee in the wallet, and the balance is below it. Top up first, then retry.',
           insufficient_balance: true,
           code: isVendorTx ? 'vendor_wallet_empty' : 'merchant_wallet_empty',
         });
