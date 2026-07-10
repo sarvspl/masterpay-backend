@@ -30,7 +30,11 @@ async function settleForTransaction(db, transactionId) {
       // Commission split: merchant earns a % of the joining fee; platform keeps the rest.
       const commission = computeMerchantCommission(settings, 'join', fee);
       if (commission > 0) {
-        await creditMerchantCommission(db, r.rows[0].merchant_id, commission, transactionId, 'Vendor joining commission');
+        // r.rows[0].id is the vendor account we just activated.
+        await creditMerchantCommission(
+          db, r.rows[0].merchant_id, commission, transactionId, 'Vendor joining commission',
+          { type: 'join', accountId: r.rows[0].id }
+        );
       }
       await recordPlatformRevenue(db, {
         type: 'vendor_activation',

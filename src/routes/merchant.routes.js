@@ -9,6 +9,7 @@ const walletCtrl = require('../controllers/wallet.controller');
 const ticketsCtrl = require('../controllers/tickets.controller');
 const withdrawalsCtrl = require('../controllers/withdrawals.controller');
 const transfersCtrl = require('../controllers/transfers.controller');
+const earningsCtrl = require('../controllers/earnings.controller');
 const { requireMerchant } = require('../middleware/auth');
 const { limiters } = require('../middleware/rateLimit');
 const { isVendorAccount } = require('../services/vendors');
@@ -110,6 +111,10 @@ router.post  ('/transactions/:id/resolve', requireMerchant, guardTxnNotVendor, p
 
 router.get   ('/sms',        requireMerchant, smsCtrl.listForMerchant);
 router.post  ('/verify',     limiters.merchantVerify, requireMerchant, smsCtrl.verifyTxnIdManually);
+
+// A marketplace's only income: commission on its vendors' joining and
+// per-verification fees.
+router.get   ('/earnings',          requireMerchant, earningsCtrl.getEarnings);
 
 router.get   ('/wallet',            requireMerchant, walletCtrl.getWallet);
 router.get   ('/wallet/recharges',  requireMerchant, walletCtrl.listRecharges);

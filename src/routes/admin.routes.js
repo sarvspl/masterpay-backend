@@ -14,6 +14,10 @@ const { limiters } = require('../middleware/rateLimit');
 
 router.post('/login', limiters.login, ctrl.login);
 router.post('/logout', ctrl.logout);
+// Throttled per-admin (NOT with `limiters.login`, which is IP-keyed and shared
+// with every login route — fumbling this twice must not lock you out of signing
+// in). requireAdmin runs first so the limiter can key on the account.
+router.post('/me/password', requireAdmin, limiters.passwordChange, ctrl.changeOwnPassword);
 router.get('/merchants', requireAdmin, ctrl.listMerchants);
 router.get('/merchants/:id', requireAdmin, ctrl.getMerchant);
 router.post('/merchants', requireAdmin, ctrl.createMerchant);

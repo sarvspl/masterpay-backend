@@ -171,6 +171,23 @@ const limiters = {
     message: 'Too many login attempts. Try again in a few minutes.',
   }),
 
+  // "Change my own password" submits the CURRENT password, so it needs
+  // throttling — but NOT with `login`. That limiter is keyed on IP alone and is
+  // shared by every login route, so a couple of fumbled attempts here would lock
+  // the user (and everyone behind the same office NAT) out of signing in at all.
+  // Key on the authenticated account instead, and mount AFTER the auth middleware.
+  passwordChange: createLimiter({
+    windowMs: 15 * 60_000,
+    max: 10,
+    keyGenerator: (req) => {
+      const id = (req.admin && req.admin.id)
+        || (req.merchant && req.merchant.id)
+        || (req.vendor && req.vendor.account_id);
+      return id ? `pwchange:${id}` : `pwchange:ip:${ipOf(req)}`;
+    },
+    message: 'Too many password change attempts. Try again in a few minutes.',
+  }),
+
   // Merchant manual verify — guards against TxnID mining from the dashboard.
   merchantVerify: createLimiter({
     windowMs: 60_000,

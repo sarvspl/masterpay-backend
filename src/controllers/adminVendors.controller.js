@@ -471,7 +471,12 @@ async function onboardVendor(req, res, next) {
         // marketplace earns its join commission, the platform keeps the rest.
         merchantCommission = computeMerchantCommission(settings, 'join', fee);
         if (merchantCommission > 0) {
-          await creditMerchantCommission(client, v.merchant_id, merchantCommission, null, 'Vendor joining commission (admin onboarding)');
+          // No source transaction exists (the fee was collected offline), so
+          // commission_account_id is the ONLY link back to the vendor here.
+          await creditMerchantCommission(
+            client, v.merchant_id, merchantCommission, null, 'Vendor joining commission (admin onboarding)',
+            { type: 'join', accountId: v.id }
+          );
         }
         revenueBooked = fee - merchantCommission;
         await recordPlatformRevenue(client, {

@@ -603,9 +603,43 @@ async function updateDevice(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── POST /api/admin/me/password ───
+ * body: { current_password, new_password }
+ *
+ * The admin changes their OWN password. The current one is re-checked against
+ * the hash here, never trusted from the client: a stolen session cookie must not
+ * be enough to lock the real admin out of their own account.
+ *
+ * Note the existing JWT stays valid — it carries no password material. Other
+ * signed-in sessions keep working until they expire.
+ */
+async function changeOwnPassword(req, res, next) {
+  try {
+    const current = String((req.body && req.body.current_password) || '');
+    const next_ = String((req.body && req.body.new_password) || '');
+
+    if (!current) return res.status(400).json({ error: 'current_password is required' });
+    if (next_.length < 8) return res.status(400).json({ error: 'new_password must be at least 8 characters' });
+    if (next_ === current) return res.status(400).json({ error: 'The new password must be different from the current one.' });
+
+    const r = await pool.query('SELECT id, password_hash FROM admins WHERE id = $1', [req.admin.id]);
+    if (r.rowCount === 0) return res.status(401).json({ error: 'Account no longer exists' });
+
+    const ok = await bcrypt.compare(current, r.rows[0].password_hash);
+    // Deliberately vague and identical in shape to a wrong-username login, so a
+    // stolen cookie can't be used to brute-force the current password quietly.
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect.' });
+
+    const hash = await bcrypt.hash(next_, 10);
+    await pool.query('UPDATE admins SET password_hash = $1 WHERE id = $2', [hash, req.admin.id]);
+
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+}
+
 module.exports = {
   login, logout, listMerchants, getMerchant, createMerchant,
   suspendMerchant, unsuspendMerchant, adjustWallet,
   getMerchantLedger, getMerchantRecharges, resetMerchantPassword,
-  updateDevice,
+  updateDevice, changeOwnPassword,
 };

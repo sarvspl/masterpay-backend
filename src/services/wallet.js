@@ -581,7 +581,10 @@ async function debitVendorVerifyFee(accountId, transactionId, settings, client =
     // the rest as revenue.
     const commission = computeMerchantCommission(settings, 'verify', fee);
     if (commission > 0) {
-      await creditMerchantCommission(c, guard.rows[0].merchant_id, commission, transactionId, 'Vendor verification commission');
+      await creditMerchantCommission(
+        c, guard.rows[0].merchant_id, commission, transactionId, 'Vendor verification commission',
+        { type: 'verify', accountId }
+      );
     }
     await recordPlatformRevenue(c, {
       type: 'verify_fee', amount: fee - commission, currency: settings.verify_charge_currency,
@@ -660,16 +663,28 @@ function computeMerchantCommission(settings, kind, feeAmount) {
   return share > amt ? amt : share;          // never exceed the fee
 }
 
-// Credit a merchant's wallet with a commission. Idempotent per source fee
-// (uniq_commission_per_transaction). Returns true if it credited.
-async function creditMerchantCommission(db, merchantId, amount, sourceTransactionId, note) {
+/**
+ * Credit a merchant's wallet with a commission. Idempotent per source fee
+ * (uniq_commission_per_transaction). Returns true if it credited.
+ *
+ * `meta` records WHAT the commission was for and WHICH vendor produced it:
+ *   { type: 'join' | 'verify', accountId }
+ * Both are stored on the ledger row so the merchant's Earnings page never has to
+ * guess by string-matching `note`.
+ *
+ * `commission_account_id` is NOT `account_id`. Setting `account_id` would file
+ * this credit in the VENDOR's wallet history; the money belongs to the merchant.
+ */
+async function creditMerchantCommission(db, merchantId, amount, sourceTransactionId, note, meta = {}) {
   const amt = Number(amount);
   if (!merchantId || !(amt > 0)) return false;
+  const type = meta.type === 'verify' ? 'verify' : meta.type === 'join' ? 'join' : null;
   try {
     await db.query(
-      `INSERT INTO wallet_ledger (merchant_id, amount, kind, source_transaction_id, note)
-       VALUES ($1, $2, 'commission', $3, $4)`,
-      [merchantId, amt, sourceTransactionId, note || 'Commission']
+      `INSERT INTO wallet_ledger
+         (merchant_id, amount, kind, source_transaction_id, note, commission_type, commission_account_id)
+       VALUES ($1, $2, 'commission', $3, $4, $5, $6)`,
+      [merchantId, amt, sourceTransactionId, note || 'Commission', type, meta.accountId || null]
     );
   } catch (e) {
     if (e.code === '23505') return false; // already credited
