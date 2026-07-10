@@ -54,8 +54,6 @@ async function listMerchants(req, res, next) {
     const where  = ['m.is_platform = FALSE'];
     const params = [];
 
-    if (filter === 'active')    where.push('m.is_suspended = FALSE');
-    if (filter === 'suspended') where.push('m.is_suspended = TRUE');
     if (q) {
       params.push(`%${q}%`);
       where.push(`(
@@ -66,17 +64,28 @@ async function listMerchants(req, res, next) {
         LOWER(m.mobile) LIKE $${params.length}
       )`);
     }
-    const whereSql = `WHERE ${where.join(' AND ')}`;
 
-    // Stats (computed across the FILTERED set, not just the current page,
-    // so the stat cards show meaningful totals as the admin filters).
+    // Two WHERE clauses on purpose.
+    //
+    // The LIST honours the status filter. The STATS must NOT: they feed the
+    // "All / Active / Suspended" chips and the stat cards. If the stats were
+    // filtered too, viewing "Active" would show "Suspended 0" even when
+    // suspended merchants exist — the chip would hide the very rows it exists
+    // to reveal. Search still narrows both, which is what an admin expects.
+    const statsWhereSql = `WHERE ${where.join(' AND ')}`;
+
+    const listWhere = [...where];
+    if (filter === 'active')    listWhere.push('m.is_suspended = FALSE');
+    if (filter === 'suspended') listWhere.push('m.is_suspended = TRUE');
+    const whereSql = `WHERE ${listWhere.join(' AND ')}`;
+
     const statsR = await pool.query(
       `SELECT COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE m.is_suspended = FALSE)::int AS active,
               COUNT(*) FILTER (WHERE m.is_suspended = TRUE)::int  AS suspended,
               COALESCE(SUM(m.wallet_balance), 0)::numeric         AS wallet_sum
          FROM merchants m
-         ${whereSql}`,
+         ${statsWhereSql}`,
       params
     );
     const stats = {
@@ -109,7 +118,14 @@ async function listMerchants(req, res, next) {
       default_api_key: undefined,
       device_auth_key: undefined,
     }));
-    res.json({ merchants, total: stats.total, limit, offset, stats });
+    // Pagination total = rows matching the LIST filter, not the stat cards
+    // (which are deliberately unfiltered). The three counts already partition
+    // the searched set, so this needs no extra query.
+    const total = filter === 'active'    ? stats.active
+                : filter === 'suspended' ? stats.suspended
+                : stats.total;
+
+    res.json({ merchants, total, limit, offset, stats });
   } catch (e) {
     next(e);
   }

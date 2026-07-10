@@ -10,6 +10,7 @@ const platformCtrl = require('../controllers/platform.controller');
 const ticketsCtrl  = require('../controllers/tickets.controller');
 const vendorsCtrl  = require('../controllers/adminVendors.controller');
 const withdrawalsCtrl = require('../controllers/withdrawals.controller');
+const financeCtrl = require('../controllers/finance.controller');
 const { limiters } = require('../middleware/rateLimit');
 
 router.post('/login', limiters.login, ctrl.login);
@@ -38,6 +39,10 @@ router.get ('/vendors/:id',                requireAdmin, vendorsCtrl.getVendor);
 router.post('/vendors/:id/onboard',        requireAdmin, vendorsCtrl.onboardVendor);
 router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
 router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
+
+// The whole business in one call: revenue booked, cash actually received, and
+// the float owed back to merchants and vendors.
+router.get('/finance', requireAdmin, financeCtrl.getFinance);
 
 // Merchant wallet withdrawals. Approving records an off-platform payout;
 // rejecting refunds the amount that was held when the request was filed.
