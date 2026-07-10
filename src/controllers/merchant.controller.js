@@ -179,7 +179,9 @@ async function me(req, res, next) {
       `SELECT m.id, m.name, m.username, m.mobile, m.email, m.domain, m.industry, m.country, m.state,
               m.currency, m.wallet_balance, m.created_at,
               (m.keys_unlocked OR COALESCE(a.keys_unlocked, FALSE)) AS keys_unlocked,
-              a.device_auth_key,
+              -- device_auth_key is deliberately NOT selected: a marketplace binds
+              -- no phone, and each seller holds their own key. Returning it here
+              -- only put an unused credential on the wire.
               b.api_key, b.id AS default_brand_id
          FROM merchants m
          LEFT JOIN accounts a ON a.merchant_id = m.id AND a.is_default = TRUE
@@ -189,18 +191,17 @@ async function me(req, res, next) {
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Merchant not found' });
 
-    // Gate the integration keys behind the one-time unlock purchase. Until the
-    // fee is paid, the keys are NOT returned at all (so they can't be read off
-    // the network). The frontend shows a purchase prompt instead.
+    // Gate the API key behind the one-time unlock purchase. Until the fee is
+    // paid it is NOT returned at all (so it can't be read off the network).
+    // The frontend shows a purchase prompt instead.
     const settings = await getPlatformSettings().catch(() => ({ key_unlock_fee: 0 }));
     const fee = Number(settings.key_unlock_fee || 0);
     const m = rows[0];
     m.key_unlock_fee = fee;
-    // fee<=0 means the gate is disabled — keys are effectively always unlocked.
+    // fee<=0 means the gate is disabled — the key is effectively always unlocked.
     m.keys_unlocked = m.keys_unlocked || fee <= 0;
     if (!m.keys_unlocked) {
       m.api_key = null;
-      m.device_auth_key = null;
     }
     res.json({ merchant: m });
   } catch (e) {

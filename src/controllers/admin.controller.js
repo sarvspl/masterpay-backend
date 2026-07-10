@@ -142,19 +142,11 @@ async function getMerchant(req, res, next) {
       api_key: undefined,
     }));
 
-    // Bound devices (with their account + contact info) so the admin can review
-    // and correct the binder's name / Telegram / WhatsApp.
-    const devicesRes = await pool.query(
-      `SELECT d.id, d.device_id, d.model, d.manufacturer, d.os_version, d.is_enabled,
-              d.last_seen_at, d.created_at, d.binder_name, d.telegram_handle, d.whatsapp,
-              d.account_id, a.label AS account_label, a.is_default AS account_is_default,
-              (d.last_seen_at IS NOT NULL AND d.last_seen_at > NOW() - INTERVAL '10 minutes') AS is_online
-         FROM devices d
-         LEFT JOIN accounts a ON a.id = d.account_id
-        WHERE d.merchant_id = $1 AND d.unbound_at IS NULL
-        ORDER BY d.created_at DESC`,
-      [req.params.id]
-    );
+    // No devices are returned here. A merchant binds no phone — every device
+    // belongs to one of its vendors, and a vendor's phones (with the binder's
+    // name / Telegram / WhatsApp) are shown under that vendor, on
+    // GET /api/admin/vendors/:id. Listing them under the merchant filed a
+    // seller's contact details against the wrong owner.
 
     // Vendors = this merchant's non-Primary accounts, with headline status so
     // the admin can review the marketplace's sellers.
@@ -191,11 +183,11 @@ async function getMerchant(req, res, next) {
       merchant: {
         ...r,
         api_key_masked: maskKey(r.default_api_key, 4),
-        device_auth_key_masked: maskKey(r.device_auth_key, 4),
         default_api_key: undefined,
+        // The Primary account's device_auth_key is not surfaced: a marketplace
+        // has no phone to bind. Each vendor's key lives on their own record.
         device_auth_key: undefined,
         brands,
-        devices: devicesRes.rows,
         vendors,
       },
     });

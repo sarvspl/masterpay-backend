@@ -13,8 +13,113 @@
  */
 const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
+const {
+  getPlatformSettings, recordPlatformRevenue,
+  computeMerchantCommission, creditMerchantCommission,
+} = require('../services/wallet');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Same rule the seller's own /vendor/register enforces. Usernames are unique
+// across every marketplace (uniq_accounts_username), not just within one.
+const USERNAME_RE = /^[a-z0-9_]{3,40}$/;
+
+function randomPassword() {
+  const alpha = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'; // no 0/O/1/l
+  let s = '';
+  for (let i = 0; i < 12; i++) s += alpha[Math.floor(Math.random() * alpha.length)];
+  return s;
+}
+
+/**
+ * Where a vendor is stuck, using the same precedence as services/availability.js
+ * so this list never disagrees with what the marketplace's API reports.
+ *
+ * `wallet_empty` here is approximate: the real check is "balance >= fee for THIS
+ * order", and we have no order. A zero balance can never cover any fee, so that
+ * is what we flag.
+ */
+function vendorState(v, settings) {
+  const activationFee = Number(settings.vendor_activation_fee || 0);
+  const chargingVendors = settings.vendor_verify_charge_enabled && (
+    (settings.vendor_verify_charge_type || 'fixed') === 'percent'
+      ? Number(settings.vendor_verify_charge_percent) > 0
+      : Number(settings.vendor_verify_charge_amount) > 0
+  );
+
+  if (!v.username) return 'never_registered';
+  if (activationFee > 0 && !v.activated_at) return 'not_activated';
+  if (Number(v.gateway_count) === 0) return 'no_payment_number';
+  if (Number(v.enabled_gateway_count) === 0) return 'all_paused';
+  if (chargingVendors && Number(v.wallet_balance) <= 0) return 'wallet_empty';
+  return 'ready';
+}
+
+/* ─── GET /api/admin/vendors ───
+ * Every vendor under every marketplace. Query: ?state=&q=&merchant_id=
+ * This is the page for finding sellers who never made it through onboarding.
+ */
+async function listVendors(req, res, next) {
+  try {
+    const settings = await getPlatformSettings().catch(() => ({}));
+
+    const params = [];
+    let where = 'a.is_default = FALSE';
+    if (req.query.merchant_id && UUID_RE.test(String(req.query.merchant_id))) {
+      params.push(req.query.merchant_id);
+      where += ` AND a.merchant_id = $${params.length}`;
+    }
+    if (req.query.q && String(req.query.q).trim()) {
+      params.push(`%${String(req.query.q).trim().toLowerCase()}%`);
+      where += ` AND (LOWER(a.label) LIKE $${params.length} OR LOWER(a.username) LIKE $${params.length}
+                      OR LOWER(a.external_id) LIKE $${params.length} OR LOWER(m.name) LIKE $${params.length})`;
+    }
+
+    const r = await pool.query(
+      `SELECT a.id, a.label, a.username, a.external_id, a.activated_at, a.wallet_balance, a.created_at,
+              a.merchant_id, m.name AS merchant_name, m.is_suspended AS merchant_suspended,
+              (SELECT COUNT(*)::int FROM gateways g WHERE g.account_id = a.id)                          AS gateway_count,
+              (SELECT COUNT(*)::int FROM gateways g WHERE g.account_id = a.id AND g.is_enabled) AS enabled_gateway_count,
+              (SELECT COUNT(*)::int FROM devices d WHERE d.account_id = a.id AND d.unbound_at IS NULL)  AS device_count,
+              (SELECT COUNT(*)::int FROM transactions t JOIN gateways g2 ON g2.id = t.gateway_id
+                WHERE g2.account_id = a.id AND t.status = 'success')                                    AS txn_count
+         FROM accounts a
+         JOIN merchants m ON m.id = a.merchant_id
+        WHERE ${where}
+        ORDER BY a.created_at DESC`,
+      params
+    );
+
+    let vendors = r.rows.map((v) => ({
+      id: v.id,
+      label: v.label,
+      username: v.username,
+      has_login: v.username != null,
+      external_id: v.external_id,
+      is_activated: v.activated_at != null,
+      wallet_balance: Number(v.wallet_balance || 0),
+      gateway_count: v.gateway_count,
+      enabled_gateway_count: v.enabled_gateway_count,
+      device_count: v.device_count,
+      txn_count: v.txn_count,
+      created_at: v.created_at,
+      merchant: { id: v.merchant_id, name: v.merchant_name, is_suspended: v.merchant_suspended },
+      state: vendorState(v, settings),
+    }));
+
+    // Counts are of the WHOLE (searched) set, so the filter chips don't lie when
+    // one state is selected.
+    const counts = vendors.reduce((acc, v) => { acc[v.state] = (acc[v.state] || 0) + 1; return acc; }, {});
+    if (req.query.state && req.query.state !== 'all') {
+      vendors = vendors.filter((v) => v.state === req.query.state);
+    }
+
+    res.json({
+      vendors,
+      counts: { all: r.rowCount, ...counts },
+      activation_fee: Number(settings.vendor_activation_fee || 0),
+    });
+  } catch (e) { next(e); }
+}
 
 // A vendor is a non-Primary account. Primary belongs to the merchant itself and
 // must never be reachable through these endpoints.
@@ -225,4 +330,195 @@ async function resetVendorPassword(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { getVendor, creditVendorWallet, resetVendorPassword };
+/* ─── POST /api/admin/vendors/:id/onboard ───
+ * Onboard a seller who never managed it themselves. Body:
+ *   { username?, password?, activate?, book_revenue?, wallet_amount?, note? }
+ *
+ *   username      required only if the vendor has no login yet
+ *   password      omit to generate one (returned once)
+ *   activate      set activated_at, letting them add a payment number
+ *   book_revenue  record the activation fee as platform revenue + merchant
+ *                 commission. TRUE = "I collected the fee offline". FALSE =
+ *                 "I waived it" — the money never appears in your income.
+ *   wallet_amount positive credit so they can cover verification fees
+ *
+ * All-or-nothing: one transaction, so a vendor is never left half-onboarded.
+ */
+async function onboardVendor(req, res, next) {
+  const client = await pool.connect();
+  try {
+    const v = await loadVendor(req.params.id);
+    if (!v) return res.status(404).json({ error: 'Vendor not found' });
+
+    const wantUsername = req.body.username != null ? String(req.body.username).trim().toLowerCase() : null;
+    const activate = !!req.body.activate;
+    const bookRevenue = !!req.body.book_revenue;
+    const walletAmount = req.body.wallet_amount != null && String(req.body.wallet_amount) !== ''
+      ? Number(req.body.wallet_amount) : 0;
+    const note = String(req.body.note || '').slice(0, 500) || 'Onboarded by admin';
+
+    // ── validate before touching anything (nothing below has run yet, and the
+    //     finally block releases the pooled client on every path) ──
+    if (!v.username && !wantUsername) {
+      return res.status(400).json({ error: 'username is required — this vendor has no login yet' });
+    }
+    if (v.username && wantUsername && wantUsername !== v.username) {
+      return res.status(409).json({
+        error: `This vendor already has the login "${v.username}". Use Reset password to change their credentials.`,
+        code: 'already_registered',
+      });
+    }
+    if (wantUsername && !USERNAME_RE.test(wantUsername)) {
+      return res.status(400).json({ error: 'Username must be 3–40 lowercase letters, numbers, or underscores' });
+    }
+    let password = req.body.password ? String(req.body.password) : null;
+    const generated = !password;
+    if (password && password.length < 6) {
+      return res.status(400).json({ error: 'password must be at least 6 characters' });
+    }
+    if (walletAmount < 0 || !Number.isFinite(walletAmount)) {
+      return res.status(400).json({ error: 'wallet_amount must be a positive number, or omitted' });
+    }
+    if (walletAmount > 10_000_000) {
+      return res.status(400).json({ error: 'wallet_amount out of range' });
+    }
+    if (bookRevenue && !activate) {
+      return res.status(400).json({ error: 'book_revenue only applies when activating' });
+    }
+    if (v.activated_at && activate) {
+      return res.status(400).json({ error: 'This vendor is already activated.' });
+    }
+
+    const settings = await getPlatformSettings().catch(() => ({}));
+    const fee = Number(settings.vendor_activation_fee || 0);
+
+    await client.query('BEGIN');
+
+    // Re-read under a row lock. `v` was loaded outside the transaction, so
+    // between that read and here another admin may have claimed this vendor.
+    // Without this, two concurrent onboards both pass the "no login yet" check,
+    // the loser's UPDATE matches zero rows (WHERE username IS NULL no longer
+    // holds), no error is raised — and we'd return HTTP 200 with a username and
+    // password that were never stored. The seller would be handed dead credentials.
+    const locked = await client.query(
+      'SELECT username FROM accounts WHERE id = $1 AND is_default = FALSE FOR UPDATE',
+      [v.id]
+    );
+    if (locked.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Vendor not found' });
+    }
+    const currentUsername = locked.rows[0].username;
+    if (!v.username && currentUsername) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `This vendor already has the login "${currentUsername}". Use Reset password to change their credentials.`,
+        code: 'already_registered',
+      });
+    }
+
+    const isNewLogin = !currentUsername;
+    if (isNewLogin) {
+      if (!password) password = randomPassword();
+      const hash = await bcrypt.hash(password, 10);
+      let upd;
+      try {
+        upd = await client.query(
+          `UPDATE accounts SET username = $2, password_hash = $3 WHERE id = $1 AND username IS NULL`,
+          [v.id, wantUsername, hash]
+        );
+      } catch (e) {
+        await client.query('ROLLBACK');
+        if (e.code === '23505') {
+          return res.status(409).json({
+            error: `The username "${wantUsername}" is already taken. Vendor usernames are unique across every marketplace.`,
+            code: 'username_taken',
+          });
+        }
+        throw e;
+      }
+      // Belt and braces: the row lock above should make this impossible, but a
+      // zero-row UPDATE must never be reported as success.
+      if (upd.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'This vendor was claimed by someone else while you were onboarding. Reload and try again.',
+          code: 'already_registered',
+        });
+      }
+    } else if (password) {
+      const hash = await bcrypt.hash(password, 10);
+      await client.query('UPDATE accounts SET password_hash = $2 WHERE id = $1', [v.id, hash]);
+    } else {
+      password = null; // existing login, no password change requested
+    }
+
+    // Vendors are supposed to be born unlocked (services/vendors.js), but legacy
+    // accounts created through the old dashboard path have keys_unlocked = FALSE.
+    // gateway.controller → accountCanAddGateways refuses those, so an "activated"
+    // vendor would still hit `403 Unlock this account before adding gateways` and
+    // could never add a payment number. Onboarding means we intend them to trade.
+    await client.query('UPDATE accounts SET keys_unlocked = TRUE WHERE id = $1 AND keys_unlocked = FALSE', [v.id]);
+
+    let revenueBooked = 0;
+    let merchantCommission = 0;
+    if (activate) {
+      await client.query('UPDATE accounts SET activated_at = NOW() WHERE id = $1 AND activated_at IS NULL', [v.id]);
+
+      if (bookRevenue && fee > 0) {
+        // Mirrors services/activation.js → settleForTransaction so an
+        // admin-onboarded vendor books exactly like a self-paid one: the
+        // marketplace earns its join commission, the platform keeps the rest.
+        merchantCommission = computeMerchantCommission(settings, 'join', fee);
+        if (merchantCommission > 0) {
+          await creditMerchantCommission(client, v.merchant_id, merchantCommission, null, 'Vendor joining commission (admin onboarding)');
+        }
+        revenueBooked = fee - merchantCommission;
+        await recordPlatformRevenue(client, {
+          type: 'vendor_activation',
+          amount: revenueBooked,
+          currency: settings.verify_charge_currency || 'BDT',
+          merchantId: v.merchant_id,
+          note: 'Vendor activation fee (collected offline, onboarded by admin)',
+        });
+      }
+    }
+
+    let balance = Number(v.wallet_balance);
+    if (walletAmount > 0) {
+      await client.query(
+        `INSERT INTO wallet_ledger (merchant_id, account_id, amount, kind, note)
+         VALUES ($1, $2, $3, 'adjustment', $4)`,
+        [v.merchant_id, v.id, walletAmount, note]
+      );
+      const upd = await client.query(
+        'UPDATE accounts SET wallet_balance = wallet_balance + $2 WHERE id = $1 RETURNING wallet_balance',
+        [v.id, walletAmount]
+      );
+      balance = Number(upd.rows[0].wallet_balance);
+    }
+
+    await client.query('COMMIT');
+
+    res.json({
+      ok: true,
+      vendor_id: v.id,
+      label: v.label,
+      username: wantUsername || v.username,
+      password,                  // shown once; null when no password was set
+      password_generated: isNewLogin && generated,
+      activated: activate || v.activated_at != null,
+      activation_fee: fee,
+      revenue_booked: revenueBooked,
+      merchant_commission: merchantCommission,
+      wallet_balance: balance,
+    });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    try { client.release(); } catch {}
+  }
+}
+
+module.exports = { getVendor, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword };

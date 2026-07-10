@@ -41,10 +41,19 @@ router.post  ('/accounts/:id/unlock',         requireMerchant, accountsCtrl.guar
 router.post  ('/accounts/:id/regenerate-key', requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.regenerateDeviceKey);
 router.delete('/accounts/:id',                requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.remove);
 
-router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
-router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);
-router.patch ('/devices/:id',     requireMerchant, deviceCtrl.updateForMerchant);
-router.delete('/devices/:id',     requireMerchant, deviceCtrl.deleteForMerchant);
+// A marketplace binds no phone of its own. Every device belongs to a vendor,
+// who manages it from their own panel (/api/vendor/devices). The operator could
+// previously list them — exposing each seller's binder name, Telegram handle and
+// WhatsApp number — and even PATCH or DELETE them, disconnecting a seller's phone.
+// Routes stay mounted so a stale client gets a clear 403 rather than a 404.
+const DEVICES_VENDOR_MANAGED = {
+  error: 'Phones belong to vendors and are managed by them in their own panel.',
+  code: 'vendor_managed',
+};
+router.get   ('/devices',         requireMerchant, (_req, res) => res.status(403).json(DEVICES_VENDOR_MANAGED));
+router.get   ('/devices/history', requireMerchant, (_req, res) => res.status(403).json(DEVICES_VENDOR_MANAGED));
+router.patch ('/devices/:id',     requireMerchant, (_req, res) => res.status(403).json(DEVICES_VENDOR_MANAGED));
+router.delete('/devices/:id',     requireMerchant, (_req, res) => res.status(403).json(DEVICES_VENDOR_MANAGED));
 
 // A merchant is a marketplace — it owns NO payment numbers. Every gateway in
 // the system belongs to a vendor and is managed only by that vendor, in their

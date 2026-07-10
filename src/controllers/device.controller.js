@@ -167,15 +167,17 @@ async function heartbeat(req, res, next) {
           AND d.device_id = $1
           AND a.device_auth_key = $2
           AND d.unbound_at IS NULL
-        RETURNING d.id, d.merchant_id`,
+        RETURNING d.id, d.merchant_id, d.account_id`,
       [device_id, auth_key]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Device not bound' });
 
-    // Attach the merchant's wallet snapshot so the APK's balance pill stays
-    // live (the APK reads `balance` from any response and emits to its bus).
-    const { getWalletStatusForMerchant } = require('../services/wallet');
-    const wallet = await getWalletStatusForMerchant(r.rows[0].merchant_id).catch(() => null);
+    // Attach the wallet snapshot of the ACCOUNT this phone is bound to, so the
+    // APK's balance pill shows the holder's own balance. A vendor's phone used
+    // to display the marketplace's balance — a number they neither control nor
+    // are charged against.
+    const { getWalletStatusForAccount } = require('../services/wallet');
+    const wallet = await getWalletStatusForAccount(r.rows[0].account_id).catch(() => null);
 
     res.json({ ok: true, ...(wallet || {}) });
   } catch (e) { next(e); }
@@ -315,9 +317,10 @@ async function poll(req, res, next) {
     );
 
     // Include the wallet snapshot so the APK balance pill updates from a poll
-    // response (no extra round-trip needed).
-    const { getWalletStatusForMerchant } = require('../services/wallet');
-    const wallet = await getWalletStatusForMerchant(merchant_id).catch(() => null);
+    // response (no extra round-trip needed). Scoped to the phone's own account:
+    // a vendor sees their wallet, not the marketplace's.
+    const { getWalletStatusForAccount } = require('../services/wallet');
+    const wallet = await getWalletStatusForAccount(account_id).catch(() => null);
 
     res.json({ verifications: r.rows, ...(wallet || {}) });
   } catch (e) { next(e); }

@@ -609,12 +609,15 @@ async function checkoutStatus(req, res, next) {
     // SMS for a match. Since SMS upload no longer auto-flips transactions,
     // this is the path that catches "SMS arrived AFTER customer hit Verify".
     //
-    // BUT: only fire when the merchant still has wallet balance for the
-    // verification fee. If they've gone to zero, the pending tx stays
-    // pending until they top up (their dashboard banner tells them).
+    // Only fire when whoever PAYS the verification fee can cover it. For a
+    // vendor-scoped session that is the vendor, not the marketplace: gating on
+    // the merchant's wallet meant a funded vendor's payment silently never
+    // auto-confirmed whenever their marketplace's balance was zero.
     if (lastTx && lastTx.status === 'pending') {
-      const { checkWalletSufficient } = require('../services/wallet');
-      const wallet = await checkWalletSufficient(s.merchant_id);
+      const { checkWalletSufficient, checkVendorWalletSufficient } = require('../services/wallet');
+      const wallet = s.account_id
+        ? await checkVendorWalletSufficient(s.account_id, Number(s.amount))
+        : await checkWalletSufficient(s.merchant_id);
       if (wallet.ok) {
         const flipped = await tryLateMatchForSession(s, lastTx);
         if (flipped) lastTx = await loadLatestTxForSession(s.id);

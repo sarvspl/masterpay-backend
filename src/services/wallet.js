@@ -445,6 +445,46 @@ async function getWalletStatusForMerchant(merchantId) {
   };
 }
 
+/**
+ * Is this account a vendor (a seller), as opposed to a merchant's own Primary?
+ * Mirrors services/vendors.js → isVendorAccount, but takes a row we already have.
+ */
+function isVendorRow(a) {
+  return !!a && !a.is_default && (a.external_id != null || a.username != null);
+}
+
+/**
+ * Wallet snapshot for the APK's balance pill, keyed on the ACCOUNT the phone is
+ * bound to — not the merchant.
+ *
+ * A vendor's phone must see the vendor's balance and the vendor's fee rate,
+ * because that is the wallet a verification actually debits. It used to call
+ * getWalletStatusForMerchant, so a seller's phone displayed the marketplace's
+ * balance — a number the seller neither controls nor is charged against.
+ *
+ * Falls back to the merchant's snapshot for a non-vendor (Primary) account.
+ */
+async function getWalletStatusForAccount(accountId) {
+  if (!accountId) return null;
+  const a = await pool.query(
+    `SELECT id, merchant_id, is_default, external_id, username, wallet_balance
+       FROM accounts WHERE id = $1`,
+    [accountId]
+  );
+  if (a.rowCount === 0) return null;
+  const row = a.rows[0];
+  if (!isVendorRow(row)) return getWalletStatusForMerchant(row.merchant_id);
+
+  const settings = await getPlatformSettings();
+  return {
+    balance:        Number(row.wallet_balance),
+    fee:            Number(settings.vendor_verify_charge_amount || 0),
+    threshold:      Number(settings.low_balance_threshold || 0),
+    charge_type:    settings.vendor_verify_charge_type || 'fixed',
+    charge_percent: Number(settings.vendor_verify_charge_percent || 0),
+  };
+}
+
 /* ─────────────────────────── VENDOR WALLET ─────────────────────────────────
  * Vendors are billed like merchants but from their own per-account wallet, at
  * an admin-set vendor-specific rate. */
@@ -647,6 +687,8 @@ module.exports = {
   creditMerchantCommission,
   computeVendorTopupFee,
   getWalletStatusForMerchant,
+  getWalletStatusForAccount,
+  isVendorRow,
   getPlatformSettings,
   computeVerifyFee,
   computeTopupFee,

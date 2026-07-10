@@ -26,8 +26,11 @@ router.post('/merchants/:id/reset-password', requireAdmin, ctrl.resetMerchantPas
 // Vendors — the admin is the only role that can see a seller's full record
 // (device key, wallet, transactions) and the only one who can top up their
 // wallet or reset their password. The marketplace operator can do neither.
+// '/vendors' MUST precede '/vendors/:id' or Express treats the list as an id.
 // The wallet route is a top-up: credit only, never a debit.
+router.get ('/vendors',                    requireAdmin, vendorsCtrl.listVendors);
 router.get ('/vendors/:id',                requireAdmin, vendorsCtrl.getVendor);
+router.post('/vendors/:id/onboard',        requireAdmin, vendorsCtrl.onboardVendor);
 router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
 router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
 
