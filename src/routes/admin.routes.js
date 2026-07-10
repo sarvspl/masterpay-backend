@@ -9,6 +9,7 @@ const supportCtrl  = require('../controllers/support.controller');
 const platformCtrl = require('../controllers/platform.controller');
 const ticketsCtrl  = require('../controllers/tickets.controller');
 const vendorsCtrl  = require('../controllers/adminVendors.controller');
+const withdrawalsCtrl = require('../controllers/withdrawals.controller');
 const { limiters } = require('../middleware/rateLimit');
 
 router.post('/login', limiters.login, ctrl.login);
@@ -33,6 +34,12 @@ router.get ('/vendors/:id',                requireAdmin, vendorsCtrl.getVendor);
 router.post('/vendors/:id/onboard',        requireAdmin, vendorsCtrl.onboardVendor);
 router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
 router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
+
+// Merchant wallet withdrawals. Approving records an off-platform payout;
+// rejecting refunds the amount that was held when the request was filed.
+router.get ('/withdrawals',             requireAdmin, withdrawalsCtrl.listForAdmin);
+router.post('/withdrawals/:id/approve', requireAdmin, withdrawalsCtrl.approve);
+router.post('/withdrawals/:id/reject',  requireAdmin, withdrawalsCtrl.reject);
 
 router.patch('/devices/:id', requireAdmin, ctrl.updateDevice);
 

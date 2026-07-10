@@ -7,6 +7,8 @@ const paymentCtrl = require('../controllers/payment.controller');
 const smsCtrl = require('../controllers/sms.controller');
 const walletCtrl = require('../controllers/wallet.controller');
 const ticketsCtrl = require('../controllers/tickets.controller');
+const withdrawalsCtrl = require('../controllers/withdrawals.controller');
+const transfersCtrl = require('../controllers/transfers.controller');
 const { requireMerchant } = require('../middleware/auth');
 const { limiters } = require('../middleware/rateLimit');
 const { isVendorAccount } = require('../services/vendors');
@@ -36,6 +38,13 @@ router.delete('/brands/:id', requireMerchant, ctrl.deleteBrand);
 // Primary account, which is not a vendor.
 router.get ('/accounts', requireMerchant, accountsCtrl.list);
 router.post('/accounts', requireMerchant, accountsCtrl.create);
+
+// The ONE thing an operator may do to a vendor after creating them: move money
+// from their own wallet onto the vendor's. Used when a seller pays the
+// marketplace in cash. Credit only — never a debit. Deliberately NOT behind
+// guardNotVendor: this route exists precisely for vendors.
+router.post  ('/accounts/:id/topup',         requireMerchant, transfersCtrl.topupVendor);
+router.get   ('/transfers',                  requireMerchant, transfersCtrl.listForMerchant);
 
 router.post  ('/accounts/:id/unlock',         requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.unlock);
 router.post  ('/accounts/:id/regenerate-key', requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.regenerateDeviceKey);
@@ -105,6 +114,11 @@ router.post  ('/verify',     limiters.merchantVerify, requireMerchant, smsCtrl.v
 router.get   ('/wallet',            requireMerchant, walletCtrl.getWallet);
 router.get   ('/wallet/recharges',  requireMerchant, walletCtrl.listRecharges);
 router.post  ('/wallet/recharge',   requireMerchant, walletCtrl.startRecharge);
+
+// Withdrawals. The balance is debited on request and refunded if the admin
+// rejects, so the wallet a merchant sees is always what they can actually spend.
+router.get   ('/withdrawals', requireMerchant, withdrawalsCtrl.listForMerchant);
+router.post  ('/withdrawals', requireMerchant, withdrawalsCtrl.create);
 
 router.get   ('/tickets',                  requireMerchant, ticketsCtrl.merchantList);
 router.post  ('/tickets',                  requireMerchant, ticketsCtrl.merchantCreate);
