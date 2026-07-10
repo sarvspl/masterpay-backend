@@ -245,71 +245,35 @@ async function remove(req, res, next) {
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    // transactions.gateway_id is ON DELETE RESTRICT: a number that has ever
+    // taken a payment can't be deleted without destroying that payment's
+    // history. Pausing it (is_enabled = FALSE) removes it from checkout and is
+    // what the user actually wants.
+    //
+    // An explicit RESTRICT raises 23001 (restrict_violation), NOT the 23503
+    // (foreign_key_violation) you'd expect — both are caught so this keeps
+    // working if the constraint is ever changed to NO ACTION.
+    if (e && (e.code === '23001' || e.code === '23503')) {
+      return res.status(409).json({
+        error: 'This payment number has payments recorded against it, so it can’t be deleted. Pause it instead — it will stop appearing at checkout.',
+        code: 'gateway_in_use',
+      });
+    }
+    next(e);
+  }
 }
 
 /**
- * A "vendor-owned" account is a non-Primary account that was provisioned as a
- * vendor (created via POST /api/vendors → external_id set) or has claimed a
- * vendor panel login (username set). The marketplace operator must NOT be able
- * to add / edit / delete gateways on such accounts from their own dashboard —
- * those belong to the vendor and are managed in the vendor's panel. The operator
- * may still pause/enable them (the toggle route is deliberately left unguarded).
+ * Write access to this controller is reached only through:
+ *   - the vendor panel      (/api/vendor/gateways, account_id forced from the token)
+ *   - the super-admin console (/api/admin/platform/gateways, the platform's own numbers)
  *
- * NOTE: these guards live only on the merchant-dashboard gateway routes. The
- * vendor panel (req.vendor) and the marketplace vendors API (req.brand) reach
- * the same controller through their own routers, which do NOT apply these — so
- * a vendor managing their own gateways, and a marketplace provisioning them via
- * API, both keep working.
+ * The merchant dashboard and the marketplace vendors API are read-only: a
+ * marketplace owns no payment numbers, and a vendor's numbers belong to the
+ * vendor. Those routers 403 every write before it reaches here. (The older
+ * guardCreateNotVendor / guardGatewayNotVendor middlewares were deleted with the
+ * merchant Gateways page — a merchant can no longer write a gateway at all, so
+ * there is nothing left for them to guard.)
  */
-async function isVendorOwnedAccount(accountId) {
-  if (!accountId) return false;
-  const r = await pool.query(
-    'SELECT is_default, external_id, username FROM accounts WHERE id = $1',
-    [accountId]
-  );
-  if (r.rowCount === 0) return false;
-  const a = r.rows[0];
-  return !a.is_default && (a.external_id != null || a.username != null);
-}
-
-const VENDOR_MANAGED_MSG =
-  'This is a vendor’s account. Its payment numbers are managed by the vendor in their own panel — you can pause or enable them, but not add, edit, or delete.';
-
-// Block CREATE when the target account (body.account_id, else Primary) is a vendor's.
-async function guardCreateNotVendor(req, res, next) {
-  try {
-    let accountId = String(req.body.account_id || '').trim();
-    if (!accountId) {
-      const r = await pool.query(
-        'SELECT id FROM accounts WHERE merchant_id = $1 AND is_default = TRUE',
-        [req.merchant.id]
-      );
-      accountId = r.rows[0] && r.rows[0].id;
-    }
-    if (await isVendorOwnedAccount(accountId)) {
-      return res.status(403).json({ error: VENDOR_MANAGED_MSG, code: 'vendor_managed' });
-    }
-    next();
-  } catch (e) { next(e); }
-}
-
-// Block UPDATE/DELETE when the target gateway belongs to a vendor's account.
-async function guardGatewayNotVendor(req, res, next) {
-  try {
-    const r = await pool.query(
-      'SELECT account_id FROM gateways WHERE id = $1 AND merchant_id = $2',
-      [req.params.id, req.merchant.id]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });
-    if (await isVendorOwnedAccount(r.rows[0].account_id)) {
-      return res.status(403).json({ error: VENDOR_MANAGED_MSG, code: 'vendor_managed' });
-    }
-    next();
-  } catch (e) { next(e); }
-}
-
-module.exports = {
-  list, create, update, toggle, remove,
-  guardCreateNotVendor, guardGatewayNotVendor,
-};
+module.exports = { list, create, update, toggle, remove };

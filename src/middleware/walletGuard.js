@@ -1,33 +1,20 @@
 /**
- * Wallet balance guard. Returns 402 + insufficient_balance:true when the
- * acting merchant doesn't have enough wallet balance to cover the
- * per-verification fee configured by the platform admin.
+ * Wallet balance guard for the APK on a merchant's own phone. Returns 402 +
+ * insufficient_balance:true when the acting merchant doesn't have enough wallet
+ * balance to cover the per-verification fee configured by the platform admin.
+ * The merchant legitimately needs to see exactly how short they are, so the
+ * detailed payload (balance / fee / threshold) is fine here.
  *
- * Two variants — they return different SHAPES because the audience differs:
- *
- *   - guardMerchant — for the X-API-Key endpoints xyz.com calls. The error
- *     eventually reaches the customer's browser, so we return a customer-safe
- *     shape with NO numeric leaks (no balance, no fee, no threshold).
- *
- *   - guardDevice — for the APK on the merchant's own phone. The merchant
- *     legitimately needs to see exactly how short they are, so the detailed
- *     payload is fine here.
+ * There used to be a sibling `guardMerchant` on POST /api/payment/sessions. It
+ * was removed: it ran BEFORE the controller and short-circuited with a generic
+ * "Merchant wallet has insufficient balance" 402 whenever the *vendor's* wallet
+ * was short — which both named the wrong wallet and masked the real reason when
+ * the vendor was unavailable for some other cause. That check now lives in
+ * services/availability.js as the `vendor_wallet_empty` reason, so createSession
+ * answers every "this vendor can't take the payment" case with one 422.
  */
 const pool = require('../db/pool');
-const { checkWalletSufficient, checkVendorWalletSufficient } = require('../services/wallet');
-
-// Customer-safe 402 — the merchant's integration sometimes leaks our error
-// payload straight to the customer, so the `error` text must be neutral and
-// the technical detail must live on a separate field the integrator can read.
-function rejectCustomerSafe(res) {
-  return res.status(402).json({
-    error: 'Services currently unavailable.',
-    merchant_message:
-      'Merchant wallet has insufficient balance to cover the per-verification fee. Top up at the dashboard.',
-    insufficient_balance: true,
-    code: 'merchant_wallet_empty',
-  });
-}
+const { checkWalletSufficient } = require('../services/wallet');
 
 // Merchant-facing 402 — surfaced to APK / dashboard, so balance / fee /
 // threshold are appropriate context.
@@ -42,37 +29,6 @@ function rejectMerchantFacing(res, info) {
     fee:       info?.fee ?? 0,
     threshold: info?.threshold ?? 0,
   });
-}
-
-async function guardMerchant(req, res, next) {
-  try {
-    const merchantId = req.brand && req.brand.merchant_id;
-    if (!merchantId) return next();
-
-    // Vendor-scoped session → the VENDOR pays the verification fee, so gate on
-    // the vendor's wallet (not the merchant's). Verify the vendor belongs to
-    // this merchant first; if it isn't a valid vendor, fall through to the
-    // merchant check and let the session controller return the precise 400.
-    const vendorId = req.body && req.body.vendor_id ? String(req.body.vendor_id).trim() : null;
-    if (vendorId) {
-      const a = await pool.query(
-        'SELECT id FROM accounts WHERE id = $1 AND merchant_id = $2 AND is_default = FALSE',
-        [vendorId, merchantId]
-      );
-      if (a.rowCount > 0) {
-        // Gate on the EXACT fee for this payment amount — a vendor whose balance
-        // can't cover the per-verification fee can't take the payment at all.
-        const amt = Number(req.body && req.body.amount);
-        const check = await checkVendorWalletSufficient(vendorId, Number.isFinite(amt) ? amt : null);
-        if (!check.ok) return rejectCustomerSafe(res);
-        return next();
-      }
-    }
-
-    const check = await checkWalletSufficient(merchantId);
-    if (!check.ok) return rejectCustomerSafe(res);
-    next();
-  } catch (e) { next(e); }
 }
 
 async function guardDevice(req, res, next) {
@@ -94,4 +50,4 @@ async function guardDevice(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { guardMerchant, guardDevice };
+module.exports = { guardDevice };

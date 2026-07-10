@@ -15,6 +15,22 @@
  */
 const pool = require('../db/pool');
 const { generateDeviceAuthKey } = require('../utils/keys');
+const { availabilityFor } = require('../services/availability');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Accepts `a,b,c` or repeated ?k=a&k=b. Trims, drops blanks, caps the list.
+function parseList(value, max = 200) {
+  if (value == null) return [];
+  const raw = Array.isArray(value) ? value : String(value).split(',');
+  const out = [];
+  for (const v of raw) {
+    const s = String(v).trim();
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
 
 function serialize(v) {
   return {
@@ -141,4 +157,45 @@ async function get(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { create, list, get };
+/* ─── GET /api/vendors/availability ───
+ * Query: ?vendor_ids=a,b  ?external_ids=seller_07,seller_88  ?amount=1200
+ *
+ * Answers "which of these sellers can take an online payment right now?" so the
+ * marketplace can decide whether to render a Pay button BEFORE the customer
+ * clicks it. Omit both id params to get every vendor under this merchant.
+ *
+ * `amount` is optional but recommended: a vendor whose only number has a
+ * min/max that excludes the cart total genuinely can't take that order, and
+ * without the amount we'd wrongly report them as payable.
+ *
+ * Each entry carries `payable`, plus (when false) a stable `reason` code and a
+ * ready-to-render bilingual `display` block.
+ */
+async function availability(req, res, next) {
+  try {
+    const ids = parseList(req.query.vendor_ids);
+    const externalIds = parseList(req.query.external_ids);
+
+    const badId = ids.find((id) => !UUID_RE.test(id));
+    if (badId) return res.status(400).json({ error: `vendor_ids contains an invalid id: ${badId}` });
+
+    let amount = null;
+    if (req.query.amount != null && String(req.query.amount).trim() !== '') {
+      amount = Number(req.query.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+      }
+    }
+
+    const m = await pool.query('SELECT currency FROM merchants WHERE id = $1', [req.brand.merchant_id]);
+    const vendors = await availabilityFor(req.brand.merchant_id, { ids, externalIds, amount });
+
+    res.json({
+      currency: (m.rows[0] && m.rows[0].currency) || 'BDT',
+      amount,
+      vendors,
+    });
+  } catch (e) { next(e); }
+}
+
+module.exports = { create, list, get, availability };

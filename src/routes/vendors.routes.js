@@ -13,22 +13,30 @@ function asMerchant(req, _res, next) {
   next();
 }
 
-router.post('/',    requireApiKey, ctrl.create);
-router.get ('/',    requireApiKey, ctrl.list);
-router.get ('/:id', requireApiKey, ctrl.get);
+router.post('/', requireApiKey, ctrl.create);
+router.get ('/', requireApiKey, ctrl.list);
 
-// Vendor payment numbers — reuse the gateway controller, scoped to the vendor's
-// account. account_id is forced from the URL so a caller can't target another
-// vendor; ownership is still re-checked inside the controller against the merchant.
+// MUST precede '/:id' — otherwise Express matches "availability" as a vendor id.
+router.get('/availability', requireApiKey, ctrl.availability);
+
+router.get('/:id', requireApiKey, ctrl.get);
+
+// Vendor payment numbers are READ-ONLY to the marketplace. A vendor's bKash /
+// Nagad numbers belong to the vendor and are managed only in their own panel
+// (/api/vendor/gateways). The marketplace operator can see them, so they can
+// support a seller, but can never add, edit, pause, or delete one — otherwise a
+// marketplace could redirect a seller's money to itself.
 router.get('/:id/gateways', requireApiKey, asMerchant, (req, res, next) => {
   req.query.account_id = req.params.id;
   return gatewayCtrl.list(req, res, next);
 });
-router.post('/:id/gateways', requireApiKey, asMerchant, (req, res, next) => {
-  req.body.account_id = req.params.id;
-  return gatewayCtrl.create(req, res, next);
-});
-router.patch('/:vendorId/gateways/:id', requireApiKey, asMerchant, gatewayCtrl.update);
-router.delete('/:vendorId/gateways/:id', requireApiKey, asMerchant, gatewayCtrl.remove);
+
+const VENDOR_OWNED = {
+  error: 'A vendor’s payment numbers are managed by the vendor in their own panel.',
+  code: 'vendor_managed',
+};
+router.post  ('/:id/gateways',           requireApiKey, (_req, res) => res.status(403).json(VENDOR_OWNED));
+router.patch ('/:vendorId/gateways/:id', requireApiKey, (_req, res) => res.status(403).json(VENDOR_OWNED));
+router.delete('/:vendorId/gateways/:id', requireApiKey, (_req, res) => res.status(403).json(VENDOR_OWNED));
 
 module.exports = router;

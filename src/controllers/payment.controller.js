@@ -3,6 +3,7 @@ const { generateSessionId } = require('../utils/session');
 const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
+const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -58,20 +59,33 @@ async function createSession(req, res, next) {
     if (!redirect_url)                            return res.status(400).json({ error: 'redirect_url is required' });
     try { new URL(redirect_url); } catch { return res.status(400).json({ error: 'redirect_url must be a valid URL' }); }
 
-    // Optional vendor scoping: a marketplace passes the vendor_id it got from
-    // POST /api/vendors. When set, the checkout shows only that vendor's
-    // gateways and only that vendor's phone(s) are notified. Omit it → the
-    // session spans the whole merchant (legacy behaviour).
-    let account_id = null;
-    if (req.body.vendor_id != null && String(req.body.vendor_id).trim() !== '') {
-      const vendorId = String(req.body.vendor_id).trim();
-      if (!UUID_RE.test(vendorId)) return res.status(400).json({ error: 'vendor_id is not a valid id' });
-      const v = await pool.query(
-        'SELECT id FROM accounts WHERE id = $1 AND merchant_id = $2',
-        [vendorId, req.brand.merchant_id]
-      );
-      if (v.rowCount === 0) return res.status(400).json({ error: 'Invalid vendor_id for this merchant' });
-      account_id = v.rows[0].id;
+    // Vendor scoping is MANDATORY. A merchant is a marketplace: it owns no
+    // payment numbers of its own, so every session must name the vendor being
+    // paid. The checkout then shows only that vendor's gateways and only that
+    // vendor's phone(s) are notified.
+    const vendorId = String(req.body.vendor_id || '').trim();
+    if (!vendorId)               return res.status(400).json({ error: 'vendor_id is required' });
+    if (!UUID_RE.test(vendorId)) return res.status(400).json({ error: 'vendor_id is not a valid id' });
+    const v = await pool.query(
+      'SELECT id FROM accounts WHERE id = $1 AND merchant_id = $2 AND is_default = FALSE',
+      [vendorId, req.brand.merchant_id]
+    );
+    if (v.rowCount === 0) return res.status(400).json({ error: 'Invalid vendor_id for this merchant' });
+    const account_id = v.rows[0].id;
+
+    // Fail fast. Most marketplaces call GET /api/vendors/availability before
+    // rendering a Pay button, but one that doesn't must still get a clean,
+    // machine-readable answer here rather than a session whose checkout page
+    // has nothing to show. Same `reason` + `display` shape as availability.
+    const avail = await availabilityForVendorId(req.brand.merchant_id, account_id, amount);
+    if (!avail.payable) {
+      return res.status(422).json({
+        error:     'vendor_unavailable',
+        reason:    avail.reason,
+        vendor_id: account_id,
+        payable:   false,
+        display:   avail.display,
+      });
     }
 
     const baseUrl = process.env.PUBLIC_CHECKOUT_BASE_URL || 'http://localhost:3000';
@@ -233,16 +247,28 @@ async function listCheckoutGateways(req, res, next) {
     // the next checkout rotates to the other(s). Pick + stamp in one statement
     // so they stay atomic.
     //
-    // When the session is vendor-scoped (account_id set), restrict to THAT
-    // vendor's gateways so the customer only ever sees the vendor they're
-    // buying from. Otherwise span the whole merchant (legacy behaviour).
+    // Customer sessions are always vendor-scoped (account_id set) — restrict to
+    // THAT vendor's gateways so the customer only ever sees the vendor they're
+    // buying from.
+    //
+    // The merchant_id fallback is NOT legacy dead code: the platform's own
+    // checkouts (merchant wallet top-up, vendor activation, vendor top-up)
+    // insert sessions directly with account_id = NULL and rely on this branch to
+    // surface the platform merchant's receiving numbers. Removing it breaks
+    // every top-up and activation payment.
     const scopeCol = s.account_id ? 'account_id' : 'merchant_id';
     const scopeVal = s.account_id || s.merchant_id;
+
+    // A gateway whose min/max excludes this order's amount can't legitimately
+    // take it, so never offer it — the customer would otherwise pick it and get
+    // stuck. A NULL bound means "no limit".
     const r = await pool.query(
       `WITH picked AS (
          SELECT DISTINCT ON (provider, variant) id
            FROM gateways
           WHERE ${scopeCol} = $1 AND is_enabled = TRUE
+            AND (min_amount IS NULL OR $2 >= min_amount)
+            AND (max_amount IS NULL OR $2 <= max_amount)
           ORDER BY provider, variant, last_shown_at ASC NULLS FIRST, id
        ),
        bumped AS (
@@ -255,7 +281,7 @@ async function listCheckoutGateways(req, res, next) {
                   g.discount_value, g.discount_type
        )
        SELECT * FROM bumped ORDER BY provider ASC, variant ASC`,
-      [scopeVal]
+      [scopeVal, Number(s.amount)]
     );
     res.json({ gateways: r.rows });
   } catch (e) { next(e); }
@@ -328,12 +354,18 @@ async function submitTxn(req, res, next) {
 
     // Validate gateway belongs to this merchant
     const g = await pool.query(
-      `SELECT id, provider, variant, account_number, label, account_id
+      `SELECT id, provider, variant, account_number, label, account_id, min_amount, max_amount
          FROM gateways WHERE id = $1 AND merchant_id = $2 AND is_enabled = TRUE`,
       [gateway_id, s.merchant_id]
     );
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
     const gateway = g.rows[0];
+
+    // listCheckoutGateways already hides gateways whose min/max excludes this
+    // order. Re-check here so a hand-crafted gateway_id can't slip past it.
+    if (!acceptsAmount(gateway, Number(s.amount))) {
+      return res.status(400).json({ error: 'This payment method does not accept this amount.' });
+    }
 
     // Vendor-scoped session: the chosen gateway must belong to the session's
     // vendor. Guards against a tampered gateway_id routing a payment to (and

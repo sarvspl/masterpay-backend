@@ -43,11 +43,23 @@ router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerc
 router.patch ('/devices/:id',     requireMerchant, deviceCtrl.updateForMerchant);
 router.delete('/devices/:id',     requireMerchant, deviceCtrl.deleteForMerchant);
 
-router.get   ('/gateways',            requireMerchant, gatewayCtrl.list);
-router.post  ('/gateways',            requireMerchant, gatewayCtrl.guardCreateNotVendor, gatewayCtrl.create);
-router.patch ('/gateways/:id',        requireMerchant, gatewayCtrl.guardGatewayNotVendor, gatewayCtrl.update);
-router.post  ('/gateways/:id/toggle', requireMerchant, gatewayCtrl.toggle); // pause/enable allowed on vendor gateways
-router.delete('/gateways/:id',        requireMerchant, gatewayCtrl.guardGatewayNotVendor, gatewayCtrl.remove);
+// A merchant is a marketplace — it owns NO payment numbers. Every gateway in
+// the system belongs to a vendor and is managed only by that vendor, in their
+// own panel (/api/vendor/gateways). The merchant keeps read-only visibility so
+// their dashboard can show which vendors are set up to take money.
+//
+// (The platform's own receiving numbers are a separate surface, managed by the
+// super-admin at /api/admin/platform/gateways.)
+router.get('/gateways', requireMerchant, gatewayCtrl.list);
+
+const VENDOR_MANAGED = {
+  error: 'Payment numbers belong to vendors and are managed by them in their own panel.',
+  code: 'vendor_managed',
+};
+router.post  ('/gateways',            requireMerchant, (_req, res) => res.status(403).json(VENDOR_MANAGED));
+router.patch ('/gateways/:id',        requireMerchant, (_req, res) => res.status(403).json(VENDOR_MANAGED));
+router.post  ('/gateways/:id/toggle', requireMerchant, (_req, res) => res.status(403).json(VENDOR_MANAGED));
+router.delete('/gateways/:id',        requireMerchant, (_req, res) => res.status(403).json(VENDOR_MANAGED));
 
 router.get   ('/transactions',                requireMerchant, paymentCtrl.listTransactions);
 router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manualResolve);

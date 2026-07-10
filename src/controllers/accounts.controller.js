@@ -272,7 +272,19 @@ async function remove(req, res, next) {
       return res.status(400).json({ error: 'Cannot delete this account. It either does not exist or is the primary account.' });
     }
     res.json({ ok: true });
-  } catch (e) { next(e); }
+  } catch (e) {
+    // Deleting an account cascades to its gateways, but transactions.gateway_id
+    // is ON DELETE RESTRICT — so an account that has ever taken a payment can't
+    // be removed without destroying that history. An explicit RESTRICT raises
+    // 23001 (restrict_violation), not 23503 (foreign_key_violation).
+    if (e && (e.code === '23001' || e.code === '23503')) {
+      return res.status(409).json({
+        error: 'This vendor has payments recorded against it, so it can’t be deleted. Its history has to be preserved.',
+        code: 'account_in_use',
+      });
+    }
+    next(e);
+  }
 }
 
 /* ─── PATCH /api/merchant/accounts/:id ───
