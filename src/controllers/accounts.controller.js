@@ -1,6 +1,7 @@
 const pool = require('../db/pool');
 const { generateDeviceAuthKey } = require('../utils/keys');
 const { getPlatformSettings, recordPlatformRevenue } = require('../services/wallet');
+const { createVendor, isVendorAccount } = require('../services/vendors');
 
 // Fee to unlock an *additional* account's device key — a flat 50% of the
 // one-time key-unlock fee. The Primary account is covered by the full fee
@@ -102,14 +103,20 @@ async function list(req, res, next) {
         id: acc.id,
         label: acc.label,
         is_default: acc.is_default,
+        external_id: acc.external_id || null,
         is_vendor,
         has_vendor_login: acc.username != null,
         keys_unlocked: unlocked,
-        device_auth_key: unlocked ? acc.device_auth_key : null,
+        // A vendor's device key is their credential — it binds their phone and,
+        // via /vendor/register, claims their panel. Holding it would let the
+        // operator impersonate the seller, so it is never sent to the merchant.
+        // The operator saw it once, at creation, to pass on to the seller.
+        device_auth_key: is_vendor ? null : (unlocked ? acc.device_auth_key : null),
         created_at: acc.created_at,
         gateways: gatewaysByAccount[acc.id] || [],
-        txn_count: s.txn_count,
-        txn_total: s.txn_total,
+        // Likewise a vendor's takings are their business, not the operator's.
+        txn_count: is_vendor ? null : s.txn_count,
+        txn_total: is_vendor ? null : s.txn_total,
         // Activation paywall (per-vendor, set by the merchant)
         activation_fee:     Number(acc.activation_fee || 0),
         is_activated:       acc.activated_at != null,
@@ -128,50 +135,48 @@ async function list(req, res, next) {
 }
 
 /* ─── POST /api/merchant/accounts ───
- * Create a new (locked) account with its own device key. Free — only unlocking
- * costs. body: { label? }
+ * The marketplace operator adds a vendor from their dashboard. Same result as
+ * the marketplace's server calling POST /api/vendors — one shared service, so a
+ * hand-added vendor and an API-added one are indistinguishable.
+ *
+ * This is the ONLY thing the operator may do to a vendor. After this they can
+ * look, and nothing else: no editing, no pausing, no deleting, no touching the
+ * seller's payment numbers.
+ *
+ * body: { label?, external_id? }
  */
 async function create(req, res, next) {
   try {
-    const label = String(req.body.label || '').trim();
-
-    const count = await pool.query(
-      'SELECT COUNT(*)::int AS n FROM accounts WHERE merchant_id = $1',
-      [req.merchant.id]
-    );
-    const finalLabel = label || `Account ${count.rows[0].n + 1}`;
-
-    // Generate a unique device key (retry on the rare UNIQUE collision).
-    let row;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const r = await pool.query(
-          `INSERT INTO accounts (merchant_id, label, device_auth_key, keys_unlocked, is_default)
-           VALUES ($1, $2, $3, FALSE, FALSE)
-           RETURNING id, label, device_auth_key, keys_unlocked, is_default, created_at`,
-          [req.merchant.id, finalLabel, generateDeviceAuthKey()]
-        );
-        row = r.rows[0];
-        break;
-      } catch (e) {
-        if (e.code === '23505' && attempt < 4) continue; // device_auth_key collision — retry
-        throw e;
-      }
-    }
-
-    // Brand-new account is locked → device key masked, no gateways yet.
-    res.status(201).json({
+    const { vendor, existed } = await createVendor(req.merchant.id, {
+      label: req.body.label,
+      externalId: req.body.external_id,
+    });
+    // The device_auth_key is the whole point — the operator hands it to the
+    // seller, who registers their panel with it.
+    res.status(existed ? 200 : 201).json({
+      existed,
       account: {
-        id: row.id,
-        label: row.label,
-        is_default: row.is_default,
-        keys_unlocked: false,
-        device_auth_key: null,
-        created_at: row.created_at,
-        gateways: [],
+        id:              vendor.vendor_id,
+        label:           vendor.label,
+        external_id:     vendor.external_id,
+        is_default:      false,
+        is_vendor:       true,
+        has_vendor_login: false,
+        keys_unlocked:   true,
+        device_auth_key: vendor.device_auth_key,
+        created_at:      vendor.created_at,
+        gateways:        [],
+        txn_count:       0,
+        txn_total:       0,
+        activation_fee:     0,
+        is_activated:       false,
+        activation_pending: false,
       },
     });
-  } catch (e) { next(e); }
+  } catch (e) {
+    if (e && e.status) return res.status(e.status).json({ error: e.message });
+    next(e);
+  }
 }
 
 /* ─── POST /api/merchant/accounts/:id/unlock ───
@@ -254,6 +259,30 @@ async function unlock(req, res, next) {
   } finally {
     client.release();
   }
+}
+
+/**
+ * The operator may ADD a vendor and VIEW it. After that the account belongs to
+ * the seller: no unlocking, no regenerating their device key, no deleting.
+ *
+ * Mount before any mutating /accounts/:id route. Lets the merchant's own
+ * Primary account through, since that isn't a vendor.
+ */
+async function guardNotVendor(req, res, next) {
+  try {
+    const owned = await pool.query(
+      'SELECT id FROM accounts WHERE id = $1 AND merchant_id = $2',
+      [req.params.id, req.merchant.id]
+    );
+    if (owned.rowCount === 0) return res.status(404).json({ error: 'Account not found' });
+    if (await isVendorAccount(req.params.id)) {
+      return res.status(403).json({
+        error: 'This is a vendor’s account. You can add and view vendors, but not change or remove them.',
+        code: 'vendor_managed',
+      });
+    }
+    next();
+  } catch (e) { next(e); }
 }
 
 /* ─── DELETE /api/merchant/accounts/:id ───
@@ -425,4 +454,4 @@ async function regenerateDeviceKey(req, res, next) {
   }
 }
 
-module.exports = { list, create, unlock, remove, extraAccountFee, setActivationFee, activate, regenerateDeviceKey };
+module.exports = { list, create, unlock, remove, extraAccountFee, setActivationFee, activate, regenerateDeviceKey, guardNotVendor };

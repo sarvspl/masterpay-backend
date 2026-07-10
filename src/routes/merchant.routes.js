@@ -9,6 +9,8 @@ const walletCtrl = require('../controllers/wallet.controller');
 const ticketsCtrl = require('../controllers/tickets.controller');
 const { requireMerchant } = require('../middleware/auth');
 const { limiters } = require('../middleware/rateLimit');
+const { isVendorAccount } = require('../services/vendors');
+const pool = require('../db/pool');
 
 const router = express.Router();
 
@@ -25,18 +27,19 @@ router.get   ('/brands',     requireMerchant, ctrl.listBrands);
 router.post  ('/brands',     requireMerchant, ctrl.createBrand);
 router.delete('/brands/:id', requireMerchant, ctrl.deleteBrand);
 
-router.get   ('/accounts',            requireMerchant, accountsCtrl.list);
-// Manual account creation from the dashboard is disabled — accounts (vendors)
-// are provisioned through the marketplace API (POST /api/vendors). The handler
-// below is intentionally kept (not deleted) so an accidental call gets a clear
-// 403 rather than a 404. accountsCtrl.create is left exported but unwired.
-router.post  ('/accounts',            requireMerchant, (req, res) => res.status(403).json({
-  error: 'Creating accounts from the dashboard is disabled. Vendors are provisioned through the marketplace API (POST /api/vendors).',
-  code: 'account_create_disabled',
-}));
-router.post  ('/accounts/:id/unlock',        requireMerchant, accountsCtrl.unlock);
-router.post  ('/accounts/:id/regenerate-key', requireMerchant, accountsCtrl.regenerateDeviceKey);
-router.delete('/accounts/:id',               requireMerchant, accountsCtrl.remove);
+// Vendors: the operator may ADD and VIEW. Nothing else.
+//
+// Once a vendor exists it belongs to the seller — the operator cannot edit,
+// pause, unlock, regenerate its device key, or delete it. Those routes stay
+// mounted (rather than deleted) so a stale client gets a clear 403 instead of a
+// confusing 404, and `guardNotVendor` lets the operator still manage their own
+// Primary account, which is not a vendor.
+router.get ('/accounts', requireMerchant, accountsCtrl.list);
+router.post('/accounts', requireMerchant, accountsCtrl.create);
+
+router.post  ('/accounts/:id/unlock',         requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.unlock);
+router.post  ('/accounts/:id/regenerate-key', requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.regenerateDeviceKey);
+router.delete('/accounts/:id',                requireMerchant, accountsCtrl.guardNotVendor, accountsCtrl.remove);
 
 router.get   ('/devices',         requireMerchant, deviceCtrl.listForMerchant);
 router.get   ('/devices/history', requireMerchant, deviceCtrl.listHistoryForMerchant);
@@ -61,8 +64,31 @@ router.patch ('/gateways/:id',        requireMerchant, (_req, res) => res.status
 router.post  ('/gateways/:id/toggle', requireMerchant, (_req, res) => res.status(403).json(VENDOR_MANAGED));
 router.delete('/gateways/:id',        requireMerchant, (_req, res) => res.status(403).json(VENDOR_MANAGED));
 
-router.get   ('/transactions',                requireMerchant, paymentCtrl.listTransactions);
-router.post  ('/transactions/:id/resolve',    requireMerchant, paymentCtrl.manualResolve);
+// A vendor's payments are the vendor's business. The operator neither sees them
+// nor resolves them — approving/rejecting a customer's payment is the seller's
+// call, made from their own panel (or their phone).
+function hideVendorTxns(req, _res, next) { req.hideVendorTxns = true; next(); }
+
+async function guardTxnNotVendor(req, res, next) {
+  try {
+    const r = await pool.query(
+      `SELECT g.account_id FROM transactions t
+         JOIN gateways g ON g.id = t.gateway_id
+        WHERE t.id = $1 AND t.merchant_id = $2`,
+      [req.params.id, req.merchant.id]
+    );
+    // 404, not 403: the operator can't see this transaction, so it must not
+    // exist as far as they're concerned.
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Transaction not found' });
+    if (await isVendorAccount(r.rows[0].account_id)) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+    next();
+  } catch (e) { next(e); }
+}
+
+router.get   ('/transactions',             requireMerchant, hideVendorTxns, paymentCtrl.listTransactions);
+router.post  ('/transactions/:id/resolve', requireMerchant, guardTxnNotVendor, paymentCtrl.manualResolve);
 
 router.get   ('/sms',        requireMerchant, smsCtrl.listForMerchant);
 router.post  ('/verify',     limiters.merchantVerify, requireMerchant, smsCtrl.verifyTxnIdManually);

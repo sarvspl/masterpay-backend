@@ -201,6 +201,14 @@ async function getSessionForMerchant(req, res, next) {
 
 /* ───────────────────────────── PUBLIC CHECKOUT (no auth, by session id) */
 
+/**
+ * Backs every public checkout endpoint. The session id is the only secret, so
+ * whatever this selects is readable by anyone holding a checkout URL.
+ *
+ * It deliberately does NOT join the vendor's label. Checkout is
+ * marketplace-branded — the customer sees the marketplace, never the seller's
+ * name — so exposing `accounts.label` here would leak seller identity.
+ */
 async function loadSession(sessionId) {
   const r = await pool.query(
     `SELECT s.id, s.amount, s.currency, s.order_id, s.customer_phone, s.customer_name,
@@ -744,6 +752,13 @@ async function listTransactions(req, res, next) {
                  LEFT JOIN payment_sessions s ON s.id = t.session_id
                  LEFT JOIN brands b ON b.id = COALESCE(t.brand_id, s.brand_id)
                 WHERE t.merchant_id = $1`;
+    // A marketplace operator must not see its sellers' payments — those are the
+    // vendor's business (customer numbers, transaction ids, proof screenshots).
+    // Set by the merchant-dashboard route only; the vendor panel and the admin
+    // console reach this same controller and must keep seeing their own rows.
+    if (req.hideVendorTxns) {
+      sql += ` AND NOT (a.is_default = FALSE AND (a.external_id IS NOT NULL OR a.username IS NOT NULL))`;
+    }
     if (status)    { params.push(status); sql += ` AND t.status = $${params.length}`; }
     if (q)         { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
     if (accountId) { params.push(accountId); sql += ` AND g.account_id = $${params.length}`; }

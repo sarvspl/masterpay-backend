@@ -8,6 +8,7 @@ const provCtrl     = require('../controllers/provider.controller');
 const supportCtrl  = require('../controllers/support.controller');
 const platformCtrl = require('../controllers/platform.controller');
 const ticketsCtrl  = require('../controllers/tickets.controller');
+const vendorsCtrl  = require('../controllers/adminVendors.controller');
 const { limiters } = require('../middleware/rateLimit');
 
 router.post('/login', limiters.login, ctrl.login);
@@ -21,6 +22,14 @@ router.post('/merchants/:id/wallet',         requireAdmin, ctrl.adjustWallet);
 router.get ('/merchants/:id/wallet/ledger',  requireAdmin, ctrl.getMerchantLedger);
 router.get ('/merchants/:id/wallet/recharges', requireAdmin, ctrl.getMerchantRecharges);
 router.post('/merchants/:id/reset-password', requireAdmin, ctrl.resetMerchantPassword);
+
+// Vendors — the admin is the only role that can see a seller's full record
+// (device key, wallet, transactions) and the only one who can top up their
+// wallet or reset their password. The marketplace operator can do neither.
+// The wallet route is a top-up: credit only, never a debit.
+router.get ('/vendors/:id',                requireAdmin, vendorsCtrl.getVendor);
+router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
+router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
 
 router.patch('/devices/:id', requireAdmin, ctrl.updateDevice);
 

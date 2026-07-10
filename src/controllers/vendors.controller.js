@@ -14,8 +14,8 @@
  * req.brand is attached by requireApiKey (middleware/apiKey.js).
  */
 const pool = require('../db/pool');
-const { generateDeviceAuthKey } = require('../utils/keys');
 const { availabilityFor } = require('../services/availability');
+const { createVendor, serialize } = require('../services/vendors');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -32,17 +32,6 @@ function parseList(value, max = 200) {
   return out;
 }
 
-function serialize(v) {
-  return {
-    vendor_id:       v.id,
-    label:           v.label,
-    external_id:     v.external_id || null,
-    device_auth_key: v.device_auth_key,
-    is_default:      v.is_default,
-    created_at:      v.created_at,
-  };
-}
-
 /* ─── POST /api/vendors ───
  * Body: { label?, external_id? }
  * Creates a vendor under the calling merchant and returns its device_auth_key.
@@ -51,67 +40,18 @@ function serialize(v) {
  */
 async function create(req, res, next) {
   try {
-    const merchantId = req.brand.merchant_id;
-    const label = String(req.body.label || '').trim();
-    const externalId = req.body.external_id != null && String(req.body.external_id).trim() !== ''
-      ? String(req.body.external_id).trim()
-      : null;
-
-    if (label.length > 120)      return res.status(400).json({ error: 'label must be at most 120 characters' });
-    if (externalId && externalId.length > 120) return res.status(400).json({ error: 'external_id must be at most 120 characters' });
-
-    // Idempotency: return the existing vendor if this external_id is already mapped.
-    if (externalId) {
-      const existing = await pool.query(
-        `SELECT id, label, device_auth_key, external_id, is_default, created_at
-           FROM accounts WHERE merchant_id = $1 AND external_id = $2`,
-        [merchantId, externalId]
-      );
-      if (existing.rowCount > 0) {
-        return res.status(200).json({ vendor: serialize(existing.rows[0]), existed: true });
-      }
-    }
-
-    const count = await pool.query(
-      'SELECT COUNT(*)::int AS n FROM accounts WHERE merchant_id = $1',
-      [merchantId]
-    );
-    const finalLabel = label || `Vendor ${count.rows[0].n + 1}`;
-
-    // Generate a unique device key (retry on the rare UNIQUE collision).
-    let row;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const r = await pool.query(
-          `INSERT INTO accounts (merchant_id, label, device_auth_key, keys_unlocked, is_default, external_id)
-           VALUES ($1, $2, $3, TRUE, FALSE, $4)
-           RETURNING id, label, device_auth_key, external_id, is_default, created_at`,
-          [merchantId, finalLabel, generateDeviceAuthKey(), externalId]
-        );
-        row = r.rows[0];
-        break;
-      } catch (e) {
-        if (e.code === '23505') {
-          // Lost a race on external_id → return the winner. Otherwise it's a
-          // device_auth_key collision → retry with a fresh key.
-          if (externalId) {
-            const again = await pool.query(
-              `SELECT id, label, device_auth_key, external_id, is_default, created_at
-                 FROM accounts WHERE merchant_id = $1 AND external_id = $2`,
-              [merchantId, externalId]
-            );
-            if (again.rowCount > 0) {
-              return res.status(200).json({ vendor: serialize(again.rows[0]), existed: true });
-            }
-          }
-          if (attempt < 4) continue;
-        }
-        throw e;
-      }
-    }
-
-    res.status(201).json({ vendor: serialize(row) });
-  } catch (e) { next(e); }
+    const { vendor, existed } = await createVendor(req.brand.merchant_id, {
+      label: req.body.label,
+      externalId: req.body.external_id,
+    });
+    // Idempotent on external_id: 200 + existed:true when we returned an
+    // existing vendor, 201 when we minted a new one.
+    if (existed) return res.status(200).json({ vendor, existed: true });
+    res.status(201).json({ vendor });
+  } catch (e) {
+    if (e && e.status) return res.status(e.status).json({ error: e.message });
+    next(e);
+  }
 }
 
 /* ─── GET /api/vendors ───
