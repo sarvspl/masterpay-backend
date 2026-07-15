@@ -351,13 +351,15 @@ async function submitTxn(req, res, next) {
     if (!gateway_id) return res.status(400).json({ error: 'gateway_id is required' });
     if (!txnid)      return res.status(400).json({ error: 'Transaction ID is required' });
 
-    // Required payment proof: the sender's number + a screenshot of the
-    // confirmation. Presence is validated here (fail fast); the screenshot file
-    // is only written once we know we'll create/link a transaction (below).
-    const sender_account = String(req.body.sender_account || '').trim();
+    // Payment proof: a screenshot of the confirmation is required. The customer
+    // no longer enters the number they paid from — the Transaction ID + the
+    // screenshot are all we collect. sender_account is therefore optional: it is
+    // kept only if some integration still sends a well-formed value, otherwise
+    // stored NULL. Presence of the screenshot is validated here (fail fast); the
+    // file itself is only written once we know we'll create/link a transaction.
+    const senderRaw      = String(req.body.sender_account || '').trim();
+    const sender_account = /^[0-9+\-\s]{4,40}$/.test(senderRaw) ? senderRaw : null;
     const proof_image    = typeof req.body.proof_image === 'string' ? req.body.proof_image : '';
-    if (!sender_account) return res.status(400).json({ error: 'Sender number is required' });
-    if (!/^[0-9+\-\s]{4,40}$/.test(sender_account)) return res.status(400).json({ error: 'Enter a valid sender mobile/account number' });
     if (!proof_image)    return res.status(400).json({ error: 'Payment screenshot is required' });
 
     // Validate gateway belongs to this merchant
