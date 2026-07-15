@@ -39,6 +39,7 @@ router.get ('/vendors/:id',                requireAdmin, vendorsCtrl.getVendor);
 router.post('/vendors/:id/onboard',        requireAdmin, vendorsCtrl.onboardVendor);
 router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
 router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
+router.post('/vendors/:id/regenerate-key', requireAdmin, vendorsCtrl.regenerateVendorDeviceKey);
 
 // The whole business in one call: revenue booked, cash actually received, and
 // the float owed back to merchants and vendors.

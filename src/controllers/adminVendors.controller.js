@@ -13,6 +13,7 @@
  */
 const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
+const { generateDeviceAuthKey } = require('../utils/keys');
 const {
   getPlatformSettings, recordPlatformRevenue,
   computeMerchantCommission, creditMerchantCommission,
@@ -330,6 +331,62 @@ async function resetVendorPassword(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── POST /api/admin/vendors/:id/regenerate-key ───
+ * Support rotates a seller's device key to a fresh long one on their behalf —
+ * e.g. the key leaked, or a legacy short key needs upgrading. The vendor can
+ * also do this from their own panel, but the admin is the escalation path when
+ * they can't. Any phone bound with the OLD key is soft-unbound (their stored key
+ * no longer matches, so they'd 401 anyway); the vendor re-enters the NEW key in
+ * the app to reconnect. The new key is returned once — it's a secret.
+ */
+async function regenerateVendorDeviceKey(req, res, next) {
+  const client = await pool.connect();
+  try {
+    if (!UUID_RE.test(String(req.params.id || ''))) {
+      return res.status(404).json({ error: 'Vendor not found' });
+    }
+    await client.query('BEGIN');
+    // Lock the vendor's account row. is_default = FALSE keeps this to real vendor
+    // accounts — never the merchant's own Primary account.
+    const a = await client.query(
+      'SELECT id FROM accounts WHERE id = $1 AND is_default = FALSE FOR UPDATE',
+      [req.params.id]
+    );
+    if (a.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Vendor not found' }); }
+    const accountId = a.rows[0].id;
+
+    // Mint a unique new key (retry on the astronomically rare UNIQUE collision).
+    let newKey;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const candidate = generateDeviceAuthKey();
+        await client.query('UPDATE accounts SET device_auth_key = $1 WHERE id = $2', [candidate, accountId]);
+        newKey = candidate;
+        break;
+      } catch (e) {
+        if (e.code === '23505' && attempt < 4) continue;
+        throw e;
+      }
+    }
+
+    // Old key no longer matches → phones bound with it would 401. Reflect that.
+    const unbound = await client.query(
+      `UPDATE devices SET unbound_at = NOW()
+        WHERE account_id = $1 AND unbound_at IS NULL
+        RETURNING id`,
+      [accountId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ device_auth_key: newKey, disconnected: unbound.rowCount });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
+}
+
 /* ─── POST /api/admin/vendors/:id/onboard ───
  * Onboard a seller who never managed it themselves. Body:
  *   { username?, password?, activate?, book_revenue?, wallet_amount?, note? }
@@ -526,4 +583,4 @@ async function onboardVendor(req, res, next) {
   }
 }
 
-module.exports = { getVendor, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword };
+module.exports = { getVendor, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword, regenerateVendorDeviceKey };
