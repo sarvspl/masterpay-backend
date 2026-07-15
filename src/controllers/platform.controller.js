@@ -78,12 +78,12 @@ async function listRecharges(req, res, next) {
              s.created_at AS session_created_at, s.metadata,
              rm.id AS merchant_id, rm.name AS merchant_name, rm.username AS merchant_username,
              t.id AS transaction_id, t.txnid_submitted, t.status AS tx_status,
-             t.result_source, t.verified_at, t.failure_reason,
+             t.result_source, t.verified_at, t.failure_reason, t.proof_image_url,
              g.provider, g.variant, g.account_number, g.label AS gateway_label
         FROM payment_sessions s
         LEFT JOIN merchants rm ON rm.id::text = (s.metadata->>'recharge_for_merchant_id')
         LEFT JOIN LATERAL (
-          SELECT id, txnid_submitted, status, result_source, verified_at, failure_reason, gateway_id
+          SELECT id, txnid_submitted, status, result_source, verified_at, failure_reason, gateway_id, proof_image_url
             FROM transactions
            WHERE session_id = s.id
            ORDER BY created_at DESC LIMIT 1
