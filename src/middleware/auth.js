@@ -26,7 +26,7 @@ async function requireMerchant(req, res, next) {
     // gets suspended mid-session is kicked out within one round-trip instead of
     // waiting for their JWT to expire.
     const r = await pool.query(
-      `SELECT is_suspended, suspended_reason FROM merchants WHERE id = $1`,
+      `SELECT is_suspended, suspended_reason, country, currency FROM merchants WHERE id = $1`,
       [payload.sub]
     );
     if (r.rowCount === 0) {
@@ -40,7 +40,14 @@ async function requireMerchant(req, res, next) {
         suspended: true,
       });
     }
-    req.merchant = { id: payload.sub, username: payload.username };
+    // country/currency ride along so country-scoped catalogs (e.g. which payment
+    // rails a merchant may configure) never have to trust a client-supplied value.
+    req.merchant = {
+      id: payload.sub,
+      username: payload.username,
+      country: r.rows[0].country,
+      currency: r.rows[0].currency,
+    };
     next();
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });

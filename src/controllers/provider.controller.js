@@ -1,6 +1,23 @@
 const pool = require('../db/pool');
 
 const ID_RE     = /^[a-z][a-z0-9_]{1,38}$/;
+
+/**
+ * merchants.country holds display names from frontend/src/lib/countries.js
+ * ('India', 'Bangladesh'), but some legacy rows contain ISO codes instead
+ * ('IN', 'BD'). Map the known aliases so those merchants still resolve to the
+ * right rails instead of silently falling through to the global catalog.
+ */
+const COUNTRY_ALIASES = {
+  in: 'India',  ind: 'India',
+  bd: 'Bangladesh', bgd: 'Bangladesh',
+};
+
+function normalizeCountry(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return null;
+  return COUNTRY_ALIASES[v.toLowerCase()] || v;
+}
 const VARIANT_RE = /^[a-z][a-z0-9_]{0,38}$/;
 const COLOR_PALETTE = ['pink','orange','purple','emerald','blue','indigo','red','amber','teal','rose','slate'];
 
@@ -22,13 +39,46 @@ function validateBody(b, isUpdate = false) {
 /* ─── Public (no auth) — used by merchant gateways page ─── */
 async function listPublic(req, res, next) {
   try {
+    // Rule: a merchant sees the providers registered for THEIR country; if their
+    // country has none registered, they fall back to the global (country IS NULL)
+    // catalog.
+    //
+    // Concretely: India has gpay/phonepe, so Indian merchants see UPI only and
+    // never bKash/Nagad. Bangladesh has no country-specific providers, so BD
+    // merchants keep seeing the global catalog exactly as before — this is why
+    // 041 left every pre-existing provider at country NULL. Registering a
+    // Bangladesh-specific provider later flips BD over automatically.
+    //
+    // ?country= is a narrowing hint from the gateways page. An authenticated
+    // merchant's own country always wins, so a client cannot request rails it
+    // isn't entitled to.
+    const country = normalizeCountry((req.merchant && req.merchant.country) || req.query.country);
+
     const { rows } = await pool.query(
-      `SELECT id, name, initials, color, variants
+      `SELECT id, name, initials, color, variants, country
          FROM providers
         WHERE is_enabled = TRUE
-        ORDER BY name ASC`
+          AND CASE
+                WHEN EXISTS (
+                  SELECT 1 FROM providers
+                   WHERE is_enabled = TRUE
+                     AND $1::text IS NOT NULL
+                     AND LOWER(country) = LOWER($1)
+                )
+                THEN LOWER(country) = LOWER($1)
+                ELSE country IS NULL
+              END
+        ORDER BY name ASC`,
+      [country]
     );
     res.json({ providers: rows });
+  } catch (e) { next(e); }
+}
+
+/* Bank catalog for the UPI gateway form's bank dropdown. */
+async function listBanksPublic(req, res, next) {
+  try {
+    res.json({ banks: require('../utils/upi').listBanks() });
   } catch (e) { next(e); }
 }
 
@@ -115,7 +165,7 @@ async function adminDelete(req, res, next) {
 }
 
 module.exports = {
-  listPublic,
+  listPublic, listBanksPublic,
   adminList, adminCreate, adminUpdate, adminDelete,
   COLOR_PALETTE,
 };
