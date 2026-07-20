@@ -78,7 +78,7 @@ async function createSession(req, res, next) {
     // rendering a Pay button, but one that doesn't must still get a clean,
     // machine-readable answer here rather than a session whose checkout page
     // has nothing to show. Same `reason` + `display` shape as availability.
-    const avail = await availabilityForVendorId(req.brand.merchant_id, account_id, amount);
+    const avail = await availabilityForVendorId(req.brand.merchant_id, account_id, amount, currency);
     if (!avail.payable) {
       return res.status(422).json({
         error:     'vendor_unavailable',
