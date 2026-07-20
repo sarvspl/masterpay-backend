@@ -4,6 +4,7 @@ const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
 const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
+const { isUpiProvider, buildUpiUri, buildAppUri } = require('../utils/upi');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -286,12 +287,48 @@ async function listCheckoutGateways(req, res, next) {
           WHERE g.id = p.id
         RETURNING g.id, g.provider, g.variant, g.account_number, g.label,
                   g.min_amount, g.max_amount, g.charge_value, g.charge_type,
-                  g.discount_value, g.discount_type
+                  g.discount_value, g.discount_type, g.vpa
        )
        SELECT * FROM bumped ORDER BY provider ASC, variant ASC`,
       [scopeVal, Number(s.amount)]
     );
-    res.json({ gateways: r.rows });
+
+    // Attach the UPI payment payload for India rails.
+    //
+    // Built server-side on purpose: the amount encoded in the QR MUST equal
+    // computeGatewayTotal (bill + charge − discount), because that is the figure
+    // the SMS matcher compares against. Letting the client build the URI from
+    // its own mirrored total would make a QR that silently fails verification
+    // the moment the two calculations drift.
+    //
+    // `pn` is the marketplace name, never the vendor's — consistent with
+    // loadSession's decision not to leak seller identity at checkout. Note this
+    // is only a hint: UPI apps display the beneficiary name registered against
+    // the VPA, so the payer will still see the vendor's real account name.
+    const gateways = r.rows.map((g) => {
+      if (!isUpiProvider(g.provider) || !g.vpa) return g;
+      const total = computeGatewayTotal(Number(s.amount), g);
+      try {
+        const upi_uri = buildUpiUri({
+          vpa: g.vpa,
+          payeeName: s.merchant_name,
+          amount: total,
+          note: s.order_id ? `Order ${s.order_id}` : null,
+        });
+        return {
+          ...g,
+          upi_uri,
+          upi_app_uri: buildAppUri(g.provider, upi_uri),
+          upi_total: total,
+        };
+      } catch {
+        // A malformed stored VPA shouldn't take the whole checkout down; the
+        // gateway just renders without a QR.
+        return g;
+      }
+    });
+
+    res.json({ gateways });
   } catch (e) { next(e); }
 }
 

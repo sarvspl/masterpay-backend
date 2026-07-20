@@ -1,5 +1,6 @@
 const pool = require('../db/pool');
 const { verifyTxnIdForMerchant } = require('./sms.controller');
+const { isUpiProvider, senderHintsForBank } = require('../utils/upi');
 
 /* Internal: resolve merchant + account from a device auth_key. Each account
  * has its own key now, so this also yields the account_id the phone belongs to.
@@ -302,6 +303,7 @@ async function poll(req, res, next) {
               g.provider,
               g.variant,
               g.account_number,
+              g.bank_code,
               s.order_id,
               s.customer_name,
               s.currency
@@ -322,7 +324,22 @@ async function poll(req, res, next) {
     const { getWalletStatusForAccount } = require('../services/wallet');
     const wallet = await getWalletStatusForAccount(account_id).catch(() => null);
 
-    res.json({ verifications: r.rows, ...(wallet || {}) });
+    // Resolve the bank's SMS sender-ID allowlist server-side and ship it with
+    // the verification, so the device matcher carries no per-bank knowledge.
+    // Adding support for another bank is then a backend deploy, not an APK
+    // release. Empty array = "no bank-specific allowlist" — the matcher must
+    // treat that as fall-back-to-generic, never as allow-anything.
+    //
+    // currency is NULL for inbound transactions with no session (LEFT JOIN
+    // above); default it so the matcher's currency gate can't be bypassed by a
+    // missing value.
+    const verifications = r.rows.map((v) => ({
+      ...v,
+      currency: v.currency || (isUpiProvider(v.provider) ? 'INR' : 'BDT'),
+      sender_hints: senderHintsForBank(v.bank_code),
+    }));
+
+    res.json({ verifications, ...(wallet || {}) });
   } catch (e) { next(e); }
 }
 
