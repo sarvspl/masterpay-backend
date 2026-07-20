@@ -27,10 +27,15 @@ const UPI_PROVIDERS = ['gpay', 'phonepe'];
 const VPA_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]{0,254})@[a-zA-Z][a-zA-Z0-9.-]{1,63}$/;
 
 /**
- * SMS sender-ID fragments per bank, matched case-insensitively as a substring of
- * the SMS address. Indian sender IDs are DLT-registered and carry a telco/circle
- * prefix and suffix that vary by operator — 'JD-SBIUPI-S', 'AX-SBIUPI-T' — so we
- * deliberately match only the middle header fragment.
+ * Registered DLT sender headers per bank.
+ *
+ * Under TRAI's DLT regime an Indian sender ID is a SIX-character alphanumeric
+ * header, delivered wrapped in an operator prefix and a category suffix that
+ * vary by telco and circle — 'SBIUPI', 'JD-SBIUPI-S', 'AX-SBIUPI'. The device
+ * matcher parses the header out of those shapes and compares it to this list
+ * exactly, so every entry here MUST be exactly 6 characters; a 4- or 7-char
+ * entry would silently never match. assertValidHeaders() below enforces that at
+ * boot rather than letting it fail quietly in production.
  *
  * SINGLE SOURCE OF TRUTH. These are resolved server-side and shipped to the
  * device in the /api/device/poll payload as `sender_hints`, so adding a bank
@@ -45,8 +50,8 @@ const BANK_SENDERS = {
   pnb:        { name: 'Punjab National Bank',  hints: ['PNBSMS', 'PNBBNK'] },
   bob:        { name: 'Bank of Baroda',        hints: ['BOBSMS', 'BOBTXN', 'BOBIBK'] },
   canara:     { name: 'Canara Bank',           hints: ['CANBNK', 'CANARA'] },
-  union:      { name: 'Union Bank of India',   hints: ['UNIONB', 'UNIONBK'] },
-  cbi:        { name: 'Central Bank of India', hints: ['CBOI', 'CENTBK'] },
+  union:      { name: 'Union Bank of India',   hints: ['UNIONB'] },
+  cbi:        { name: 'Central Bank of India', hints: ['CENTBK', 'CBIIND'] },
   idfc:       { name: 'IDFC FIRST Bank',       hints: ['IDFCFB', 'IDFCBK'] },
   yes:        { name: 'YES Bank',              hints: ['YESBNK', 'YESBLR'] },
   indusind:   { name: 'IndusInd Bank',         hints: ['INDUSB', 'INDUSD'] },
@@ -58,6 +63,26 @@ const BANK_SENDERS = {
   rbl:        { name: 'RBL Bank',              hints: ['RBLBNK'] },
   au:         { name: 'AU Small Finance Bank', hints: ['AUBANK', 'AUSFBL'] },
 };
+
+/**
+ * Fail fast at boot on a malformed header. A wrong-length entry can't ever match
+ * a parsed DLT header, so every payment through that bank would fall to manual
+ * review with no obvious cause — exactly the kind of fault that hides for weeks.
+ */
+function assertValidHeaders() {
+  const bad = [];
+  for (const [code, entry] of Object.entries(BANK_SENDERS)) {
+    for (const h of entry.hints) {
+      if (!/^[A-Z0-9]{6}$/.test(h)) bad.push(`${code}: "${h}"`);
+    }
+  }
+  if (bad.length) {
+    throw new Error(
+      `Invalid DLT sender header(s) in BANK_SENDERS — must be exactly 6 uppercase alphanumerics: ${bad.join(', ')}`
+    );
+  }
+}
+assertValidHeaders();
 
 function isUpiProvider(provider) {
   return UPI_PROVIDERS.includes(String(provider || '').toLowerCase());
