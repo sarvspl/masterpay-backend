@@ -86,7 +86,7 @@ async function listBanksPublic(req, res, next) {
 async function adminList(req, res, next) {
   try {
     const { rows } = await pool.query(
-      `SELECT p.id, p.name, p.initials, p.color, p.variants, p.is_enabled, p.created_at,
+      `SELECT p.id, p.name, p.initials, p.color, p.variants, p.is_enabled, p.country, p.created_at,
               (SELECT COUNT(*)::int FROM gateways WHERE provider = p.id) AS gateway_count
          FROM providers p
         ORDER BY p.name ASC`
