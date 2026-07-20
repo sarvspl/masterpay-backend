@@ -4,7 +4,7 @@ const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
 const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
-const { isUpiProvider, buildUpiUri, buildAppUri } = require('../utils/upi');
+const { isUpiProvider, buildUpiUri, buildAppUri, providersNotAccepting } = require('../utils/upi');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -271,6 +271,16 @@ async function listCheckoutGateways(req, res, next) {
     // A gateway whose min/max excludes this order's amount can't legitimately
     // take it, so never offer it — the customer would otherwise pick it and get
     // stuck. A NULL bound means "no limit".
+    //
+    // Same reasoning for currency: a rail can only receive one. The platform
+    // merchant deliberately holds both the BD wallet rails and the India UPI
+    // ones, because it collects top-ups and activation fees from vendors in both
+    // countries — but any single checkout is in one currency, and offering a
+    // GPay button on a BDT top-up sends the payer to a rail that physically
+    // cannot settle their order. Filtered in SQL rather than after the fact so a
+    // hidden gateway doesn't get its round-robin last_shown_at bumped.
+    const excludedProviders = providersNotAccepting(s.currency);
+
     const r = await pool.query(
       `WITH picked AS (
          SELECT DISTINCT ON (provider, variant) id
@@ -278,6 +288,7 @@ async function listCheckoutGateways(req, res, next) {
           WHERE ${scopeCol} = $1 AND is_enabled = TRUE
             AND (min_amount IS NULL OR $2 >= min_amount)
             AND (max_amount IS NULL OR $2 <= max_amount)
+            AND provider <> ALL($3::text[])
           ORDER BY provider, variant, last_shown_at ASC NULLS FIRST, id
        ),
        bumped AS (
@@ -290,7 +301,7 @@ async function listCheckoutGateways(req, res, next) {
                   g.discount_value, g.discount_type, g.vpa
        )
        SELECT * FROM bumped ORDER BY provider ASC, variant ASC`,
-      [scopeVal, Number(s.amount)]
+      [scopeVal, Number(s.amount), excludedProviders]
     );
 
     // Attach the UPI payment payload for India rails.
@@ -412,6 +423,15 @@ async function submitTxn(req, res, next) {
     // order. Re-check here so a hand-crafted gateway_id can't slip past it.
     if (!acceptsAmount(gateway, Number(s.amount))) {
       return res.status(400).json({ error: 'This payment method does not accept this amount.' });
+    }
+
+    // Likewise for currency. A rail receives one currency only, so paying a BDT
+    // order into a UPI gateway could never be verified — the bank SMS would be
+    // in rupees and the device would flag it as a misconfiguration. Fail here
+    // with a clear message rather than taking the customer's money into a
+    // gateway that can't settle it.
+    if (providersNotAccepting(s.currency).includes(String(gateway.provider).toLowerCase())) {
+      return res.status(400).json({ error: `This payment method cannot accept ${s.currency} payments.` });
     }
 
     // Vendor-scoped session: the chosen gateway must belong to the session's

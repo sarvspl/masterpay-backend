@@ -84,6 +84,43 @@ function assertValidHeaders() {
 }
 assertValidHeaders();
 
+/**
+ * The only currency each payment rail can physically receive.
+ *
+ * Covers every rail, not just UPI — it lives here because the India work is what
+ * made it matter. Mirrors PROVIDER_CURRENCY in mobile/src/lib/matcher.js and
+ * Matcher.kt; the device applies the same rule when matching an SMS, so the two
+ * MUST agree. If they drift, checkout offers a gateway that verification then
+ * refuses.
+ */
+const PROVIDER_CURRENCY = {
+  gpay:    'INR',
+  phonepe: 'INR',
+  bkash:   'BDT',
+  nagad:   'BDT',
+  rocket:  'BDT',
+  upay:    'BDT',
+};
+
+/** Currencies we have SMS keywords for, and can therefore reason about. */
+const MODELLED_CURRENCIES = new Set(['INR', 'BDT']);
+
+/**
+ * Providers that cannot receive `currency`, for filtering a checkout.
+ *
+ * Returns [] when we don't model the currency — a merchant billing in USD while
+ * collecting through bKash is not a contradiction we can judge, and hiding every
+ * gateway would leave them with an empty checkout. Same rule the device matcher
+ * uses before flagging a currency conflict.
+ */
+function providersNotAccepting(currency) {
+  const c = String(currency || '').toUpperCase();
+  if (!MODELLED_CURRENCIES.has(c)) return [];
+  return Object.entries(PROVIDER_CURRENCY)
+    .filter(([, railCurrency]) => railCurrency !== c)
+    .map(([provider]) => provider);
+}
+
 function isUpiProvider(provider) {
   return UPI_PROVIDERS.includes(String(provider || '').toLowerCase());
 }
@@ -186,6 +223,8 @@ function buildAppUri(provider, upiUri) {
 module.exports = {
   UPI_PROVIDERS,
   VPA_RE,
+  PROVIDER_CURRENCY,
+  providersNotAccepting,
   isUpiProvider,
   isValidVpa,
   normalizeVpa,
