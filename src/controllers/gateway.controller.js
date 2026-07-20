@@ -1,6 +1,7 @@
 const pool = require('../db/pool');
 const { extractTxnId, extractAmount, findGatewayInSms, extractPayer, extractDirection } = require('./sms.controller');
 const { getPlatformSettings } = require('../services/wallet');
+const { isUpiProvider, extractVpa, senderHintsForBank, listBanks } = require('../utils/upi');
 
 // An account may add gateways once its device key is unlocked — or always, if
 // the key-unlock gate is disabled platform-wide (fee 0).
@@ -35,6 +36,37 @@ function validateBody(body) {
     return 'Invalid charge_type';
   if (body.discount_type && !CHARGE_TYPES.includes(body.discount_type))
     return 'Invalid discount_type';
+  return null;
+}
+
+/**
+ * Extra rules for UPI gateways (gpay/phonepe).
+ *
+ * The account_number check is the important one. GPay and PhonePe never send an
+ * SMS — the vendor's BANK does, and that SMS quotes the bank account tail
+ * ("A/c XX4328 credited...") and never the VPA. A vendor who pastes their UPI
+ * ID into account_number gets a gateway that silently never matches a payment.
+ * Rejecting it here converts a silent production failure into a form error.
+ */
+function validateUpiBody(body) {
+  const vpa = extractVpa(body.vpa);
+  if (!vpa) return 'A valid UPI ID is required (e.g. yourname@okaxis). You can also upload your UPI QR and we will read the ID from it.';
+
+  const account_number = String(body.account_number || '').trim();
+  const digits = account_number.replace(/\D/g, '');
+  if (digits.length < 4) {
+    return 'For UPI, Account number must be your BANK ACCOUNT number (or its last 4 digits, e.g. 4328) — not your UPI ID. Your bank quotes this in the payment SMS we read to confirm payments.';
+  }
+  if (account_number.includes('@')) {
+    return 'Account number looks like a UPI ID. Put the UPI ID in the UPI ID field and your bank account number (or last 4 digits) here.';
+  }
+
+  if (body.bank_code) {
+    const code = String(body.bank_code).toLowerCase();
+    if (senderHintsForBank(code).length === 0) {
+      return `Unknown bank code "${body.bank_code}". Allowed: ${listBanks().map((b) => b.code).join(', ')}`;
+    }
+  }
   return null;
 }
 
@@ -126,7 +158,7 @@ async function list(req, res, next) {
       `SELECT id, account_id, provider, variant, account_number, label,
               min_amount, max_amount, charge_value, charge_type,
               discount_value, discount_type, balance_check, is_enabled,
-              created_at, updated_at
+              vpa, bank_code, created_at, updated_at
          FROM gateways
         WHERE ${where}
         ORDER BY created_at ASC`,
@@ -145,6 +177,12 @@ async function create(req, res, next) {
     const variant  = String(req.body.variant || '').toLowerCase();
     const providerErr = await validateProviderVariant(provider, variant);
     if (providerErr) return res.status(400).json({ error: providerErr });
+
+    const upi = isUpiProvider(provider);
+    if (upi) {
+      const upiErr = validateUpiBody(req.body);
+      if (upiErr) return res.status(400).json({ error: upiErr });
+    }
 
     // Gateways belong to a specific account. When account_id is omitted (e.g.
     // the platform-merchant admin console, which has a single account), fall
@@ -165,8 +203,8 @@ async function create(req, res, next) {
       `INSERT INTO gateways (
          merchant_id, account_id, provider, variant, account_number, label,
          min_amount, max_amount, charge_value, charge_type,
-         discount_value, discount_type, balance_check
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         discount_value, discount_type, balance_check, vpa, bank_code
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
         req.merchant.id, account_id, provider, variant, account_number,
@@ -175,6 +213,8 @@ async function create(req, res, next) {
         toNum(req.body.charge_value), req.body.charge_type || null,
         toNum(req.body.discount_value), req.body.discount_type || null,
         !!req.body.balance_check,
+        upi ? extractVpa(req.body.vpa) : null,
+        upi && req.body.bank_code ? String(req.body.bank_code).toLowerCase() : null,
       ]
     );
     const gateway = r.rows[0];
@@ -195,6 +235,26 @@ async function update(req, res, next) {
     // account_number may change.
     const account_number = req.body.account_number ? String(req.body.account_number).trim() : null;
 
+    // provider is immutable here, so read it off the existing row to decide
+    // whether the UPI rules apply.
+    const existing = await pool.query(
+      `SELECT provider, vpa, bank_code, account_number FROM gateways WHERE id = $1 AND merchant_id = $2`,
+      [req.params.id, req.merchant.id]
+    );
+    if (existing.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });
+
+    const upi = isUpiProvider(existing.rows[0].provider);
+    if (upi) {
+      // Validate against the merged result, so a partial edit (e.g. label only)
+      // isn't rejected for omitting fields that are already stored and valid.
+      const upiErr = validateUpiBody({
+        vpa: req.body.vpa != null ? req.body.vpa : existing.rows[0].vpa,
+        bank_code: req.body.bank_code != null ? req.body.bank_code : existing.rows[0].bank_code,
+        account_number: account_number || existing.rows[0].account_number,
+      });
+      if (upiErr) return res.status(400).json({ error: upiErr });
+    }
+
     const r = await pool.query(
       `UPDATE gateways SET
          account_number = COALESCE($3, account_number),
@@ -206,6 +266,8 @@ async function update(req, res, next) {
          discount_value = $9,
          discount_type  = $10,
          balance_check  = COALESCE($11, balance_check),
+         vpa            = COALESCE($12, vpa),
+         bank_code      = COALESCE($13, bank_code),
          updated_at     = NOW()
        WHERE id = $1 AND merchant_id = $2
        RETURNING *`,
@@ -217,6 +279,8 @@ async function update(req, res, next) {
         toNum(req.body.charge_value), req.body.charge_type || null,
         toNum(req.body.discount_value), req.body.discount_type || null,
         typeof req.body.balance_check === 'boolean' ? req.body.balance_check : null,
+        upi && req.body.vpa != null ? extractVpa(req.body.vpa) : null,
+        upi && req.body.bank_code != null ? String(req.body.bank_code).toLowerCase() : null,
       ]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });

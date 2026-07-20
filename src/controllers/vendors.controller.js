@@ -127,11 +127,19 @@ async function availability(req, res, next) {
       }
     }
 
+    // Same resolution order as session creation (explicit > merchant default),
+    // so what this endpoint reports matches what the checkout will actually
+    // offer. A payment rail receives one currency only, so a vendor holding
+    // nothing that can take this one is genuinely unavailable for it.
     const m = await pool.query('SELECT currency FROM merchants WHERE id = $1', [req.brand.merchant_id]);
-    const vendors = await availabilityFor(req.brand.merchant_id, { ids, externalIds, amount });
+    const currency = (req.query.currency ? String(req.query.currency).toUpperCase() : null)
+                  || (m.rows[0] && m.rows[0].currency)
+                  || 'BDT';
+
+    const vendors = await availabilityFor(req.brand.merchant_id, { ids, externalIds, amount, currency });
 
     res.json({
-      currency: (m.rows[0] && m.rows[0].currency) || 'BDT',
+      currency,
       amount,
       vendors,
     });

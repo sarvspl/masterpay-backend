@@ -18,6 +18,7 @@
  */
 const pool = require('../db/pool');
 const { getPlatformSettings, computeVendorVerifyFee } = require('./wallet');
+const { providersNotAccepting } = require('../utils/upi');
 
 /* Stable reason codes. Never rename one — integrators branch on these. */
 const REASONS = {
@@ -27,6 +28,7 @@ const REASONS = {
   NO_GATEWAYS:         'no_gateways',
   ALL_PAUSED:          'all_paused',
   AMOUNT_OUT_OF_RANGE: 'amount_out_of_range',
+  CURRENCY_UNSUPPORTED: 'currency_unsupported',
   VENDOR_WALLET_EMPTY: 'vendor_wallet_empty',
 };
 
@@ -61,6 +63,13 @@ function displayFor(reason, vendorLabel) {
         title: 'Amount not supported',
         message: `${who} cannot accept online payment for this amount.`,
         message_bn: 'এই পরিমাণ অর্থের জন্য এই বিক্রেতা অনলাইন পেমেন্ট নিতে পারবেন না।',
+        suggested_action: 'offer_alternate_method',
+      };
+    case REASONS.CURRENCY_UNSUPPORTED:
+      return {
+        title: 'Currency not supported',
+        message: `${who} cannot accept online payment in this currency.`,
+        message_bn: 'এই মুদ্রায় এই বিক্রেতা অনলাইন পেমেন্ট নিতে পারবেন না।',
         suggested_action: 'offer_alternate_method',
       };
     default:
@@ -131,7 +140,7 @@ function vendorWalletCovers(vendor, amount, settings) {
  * integrator always gets the most actionable explanation.
  */
 function evaluateVendor(vendor, gateways, opts) {
-  const { amount, settings } = opts;
+  const { amount, currency, settings } = opts;
 
   // Never registered a panel login → the seller never claimed their code.
   if (vendor.username == null) return unavailable(vendor, REASONS.NOT_REGISTERED);
@@ -147,8 +156,19 @@ function evaluateVendor(vendor, gateways, opts) {
   const enabled = gateways.filter((g) => g.is_enabled);
   if (enabled.length === 0)                      return unavailable(vendor, REASONS.ALL_PAUSED);
 
-  const usable = enabled.filter((g) => acceptsAmount(g, amount));
-  if (usable.length === 0)                       return unavailable(vendor, REASONS.AMOUNT_OUT_OF_RANGE);
+  const inRange = enabled.filter((g) => acceptsAmount(g, amount));
+  if (inRange.length === 0)                      return unavailable(vendor, REASONS.AMOUNT_OUT_OF_RANGE);
+
+  // A rail receives one currency only — a UPI gateway can't settle a BDT order
+  // and a bKash number can't settle an INR one. checkout hides those gateways,
+  // so a vendor holding none that match this currency would leave the customer
+  // on an empty page. Report it here instead, which is the whole point of this
+  // service. A currency we don't model excludes nothing.
+  const blocked = providersNotAccepting(currency);
+  const usable = blocked.length
+    ? inRange.filter((g) => !blocked.includes(String(g.provider).toLowerCase()))
+    : inRange;
+  if (usable.length === 0)                       return unavailable(vendor, REASONS.CURRENCY_UNSUPPORTED);
 
   // A vendor pays the per-verification fee from their OWN wallet. If they can't
   // cover it, submitTxn would reject the customer with a 402 after they'd
@@ -193,7 +213,7 @@ function evaluateVendor(vendor, gateways, opts) {
  *
  * Two queries total regardless of how many vendors are requested.
  */
-async function availabilityFor(merchantId, { ids = [], externalIds = [], amount = null } = {}) {
+async function availabilityFor(merchantId, { ids = [], externalIds = [], amount = null, currency = null } = {}) {
   const settings = await getPlatformSettings().catch(() => ({ vendor_activation_fee: 0 }));
 
   const rows = (ids.length || externalIds.length)
@@ -228,7 +248,7 @@ async function availabilityFor(merchantId, { ids = [], externalIds = [], amount 
   }
 
   const evaluated = rows.map((v) =>
-    evaluateVendor(v, gatewaysByAccount.get(v.id) || [], { amount, settings })
+    evaluateVendor(v, gatewaysByAccount.get(v.id) || [], { amount, currency, settings })
   );
 
   // Re-key so the caller gets exactly the vendors it asked for, in order, with
@@ -251,8 +271,8 @@ async function availabilityFor(merchantId, { ids = [], externalIds = [], amount 
  * Single-vendor check used by createSession. `vendorId` must already be known
  * to belong to `merchantId`.
  */
-async function availabilityForVendorId(merchantId, vendorId, amount = null) {
-  const list = await availabilityFor(merchantId, { ids: [vendorId], amount });
+async function availabilityForVendorId(merchantId, vendorId, amount = null, currency = null) {
+  const list = await availabilityFor(merchantId, { ids: [vendorId], amount, currency });
   return list[0];
 }
 

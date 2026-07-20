@@ -23,7 +23,24 @@ const pool = require('../db/pool');
 
 const router = express.Router();
 
-function asMerchant(req, _res, next) { req.merchant = { id: req.vendor.merchant_id }; next(); }
+// country/currency come from the parent marketplace merchant so that
+// country-scoped catalogs (which payment rails this vendor may configure) match
+// what the merchant sees. Looked up per-request rather than carried in the JWT
+// so a marketplace changing country takes effect without re-issuing tokens.
+async function asMerchant(req, _res, next) {
+  try {
+    const r = await pool.query(
+      'SELECT country, currency FROM merchants WHERE id = $1',
+      [req.vendor.merchant_id]
+    );
+    req.merchant = {
+      id: req.vendor.merchant_id,
+      country: r.rows[0] ? r.rows[0].country : null,
+      currency: r.rows[0] ? r.rows[0].currency : null,
+    };
+    next();
+  } catch (e) { next(e); }
+}
 function scopeAccountQuery(req, _res, next) { req.query.account_id = req.vendor.account_id; next(); }
 function scopeAccountBody(req, _res, next) { req.body.account_id = req.vendor.account_id; next(); }
 
