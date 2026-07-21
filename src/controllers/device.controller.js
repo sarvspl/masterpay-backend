@@ -300,6 +300,10 @@ async function poll(req, res, next) {
               t.amount,
               t.customer_phone,
               t.created_at,
+              -- UPI only: the name the customer said their UPI account is in.
+              -- Matched against the payer name in the GPay/PhonePe notification,
+              -- since those rails give the customer no TxnID to quote.
+              t.payer_name_claimed,
               g.provider,
               g.variant,
               g.account_number,
