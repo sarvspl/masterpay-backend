@@ -442,17 +442,16 @@ async function submitTxn(req, res, next) {
     // Wallet rails put a TrxID in their own confirmation SMS, so the customer
     // reads it straight off the message and it is required.
     //
-    // UPI collects BOTH, because the vendor's phone gets two independent
-    // signals and either can settle the payment:
+    // UPI requires BOTH, because the vendor's phone receives two independent
+    // signals and either one settles the payment:
     //
     //   - the bank's SMS, which quotes the 12-digit UTR
     //   - the GPay/PhonePe notification, which names the payer
     //
-    // The name is required and the UTR is not, deliberately. The UTR is the
-    // stronger evidence — it is unique, so it can never settle the wrong order —
-    // but it sits several screens deep in both apps and demanding it loses more
-    // payments than it verifies. So: everyone can supply a name, and whoever
-    // also supplies a UTR gets the faster, stronger path.
+    // Requiring both at INPUT is not the same as requiring both to MATCH:
+    // whichever arrives first and matches approves the payment, with no wait for
+    // the other. Collecting both simply means neither signal can be the one we
+    // happen to be missing.
     const upi = isUpiProvider(gateway.provider);
     const txnid = txnidRaw || null;
     const payer_name_claimed = upi ? payerNameRaw : null;
@@ -460,6 +459,9 @@ async function submitTxn(req, res, next) {
     if (upi) {
       if (!payer_name_claimed) {
         return res.status(400).json({ error: 'Please enter the name your UPI account is registered in.' });
+      }
+      if (!txnid) {
+        return res.status(400).json({ error: 'Please enter the UPI reference number (UTR) from your payment.' });
       }
       // The whole name must match what the app reports, so a single initial or
       // stray word can never settle a payment. Rejecting it here gives the
