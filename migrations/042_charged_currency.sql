@@ -1,0 +1,13 @@
+-- Record the currency a payment was actually CHARGED in, when it differs from
+-- the currency the session is priced in.
+--
+-- Wallet top-ups may be paid through any rail the merchant likes, including one
+-- that settles in another currency (a BDT-priced top-up paid by UPI, which can
+-- only receive INR). The bank SMS then quotes rupees while the session says
+-- taka, so the verifier needs to know which currency to expect or it flags every
+-- such payment as a misconfigured gateway.
+--
+-- NULL means "same as the session" — every existing row, and every payment on a
+-- matching rail. ADDITIVE ONLY: nullable, no backfill, no existing row touched.
+-- See backend/rollback/042_charged_currency.rollback.sql.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS charged_currency VARCHAR(8);

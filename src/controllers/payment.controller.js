@@ -4,7 +4,7 @@ const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
 const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
-const { isUpiProvider, buildUpiUri, buildAppUri, providersNotAccepting } = require('../utils/upi');
+const { isUpiProvider, buildUpiUri, buildAppUri, providersNotAccepting, railCurrency } = require('../utils/upi');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -272,14 +272,21 @@ async function listCheckoutGateways(req, res, next) {
     // take it, so never offer it — the customer would otherwise pick it and get
     // stuck. A NULL bound means "no limit".
     //
-    // Same reasoning for currency: a rail can only receive one. The platform
-    // merchant deliberately holds both the BD wallet rails and the India UPI
-    // ones, because it collects top-ups and activation fees from vendors in both
-    // countries — but any single checkout is in one currency, and offering a
-    // GPay button on a BDT top-up sends the payer to a rail that physically
-    // cannot settle their order. Filtered in SQL rather than after the fact so a
-    // hidden gateway doesn't get its round-robin last_shown_at bumped.
-    const excludedProviders = providersNotAccepting(s.currency);
+    // Same reasoning for currency: a rail can only receive one, so a GPay button
+    // on a BDT sale would send the customer to a rail that cannot settle their
+    // order. Filtered in SQL rather than after the fact so a hidden gateway
+    // doesn't get its round-robin last_shown_at bumped.
+    //
+    // EXCEPT wallet top-ups, where every rail is offered. That is a business
+    // paying the platform directly and choosing how to settle, not a consumer
+    // paying a vendor — so the merchant may deliberately pay a taka invoice
+    // through UPI. The amount is NOT converted (there is no FX rate in the
+    // system): the same numeral is charged in the rail's own currency, so
+    // ৳2,020 paid by UPI costs ₹2,020. The checkout states the charge currency
+    // per gateway so the choice is explicit rather than a silent overcharge —
+    // see charge_currency below and the notice in the UI.
+    const isWalletTopup = s.metadata && s.metadata.type === 'wallet_topup';
+    const excludedProviders = isWalletTopup ? [] : providersNotAccepting(s.currency);
 
     const r = await pool.query(
       `WITH picked AS (
@@ -316,7 +323,15 @@ async function listCheckoutGateways(req, res, next) {
     // loadSession's decision not to leak seller identity at checkout. Note this
     // is only a hint: UPI apps display the beneficiary name registered against
     // the VPA, so the payer will still see the vendor's real account name.
-    const gateways = r.rows.map((g) => {
+    const gateways = r.rows.map((row) => {
+      // What this rail will actually take the money in. Equals the session
+      // currency for every normal checkout; differs only on a wallet top-up
+      // settled through a foreign rail, where the payer is charged the same
+      // NUMBER in a different currency. Surfaced so the UI can say so plainly
+      // instead of showing a taka figure against a rupee QR.
+      const charge_currency = railCurrency(row.provider) || s.currency;
+      const g = { ...row, charge_currency, charge_currency_differs: charge_currency !== s.currency };
+
       if (!isUpiProvider(g.provider) || !g.vpa) return g;
       const total = computeGatewayTotal(Number(s.amount), g);
       try {
@@ -427,12 +442,21 @@ async function submitTxn(req, res, next) {
 
     // Likewise for currency. A rail receives one currency only, so paying a BDT
     // order into a UPI gateway could never be verified — the bank SMS would be
-    // in rupees and the device would flag it as a misconfiguration. Fail here
-    // with a clear message rather than taking the customer's money into a
-    // gateway that can't settle it.
-    if (providersNotAccepting(s.currency).includes(String(gateway.provider).toLowerCase())) {
+    // in rupees and the device would flag it as a misconfiguration.
+    //
+    // Wallet top-ups are exempt: the merchant is paying the platform and may
+    // deliberately settle a taka invoice through UPI, having been told at
+    // checkout that the charge is taken in the rail's currency. Record which
+    // currency was actually charged so the verifier expects the right one — the
+    // session records what was invoiced, not what was paid.
+    const isWalletTopup = s.metadata && s.metadata.type === 'wallet_topup';
+    const railCur = railCurrency(gateway.provider);
+    const crossCurrency = !!railCur && railCur !== String(s.currency).toUpperCase();
+
+    if (!isWalletTopup && providersNotAccepting(s.currency).includes(String(gateway.provider).toLowerCase())) {
       return res.status(400).json({ error: `This payment method cannot accept ${s.currency} payments.` });
     }
+    const chargedCurrency = crossCurrency ? railCur : null;
 
     // Vendor-scoped session: the chosen gateway must belong to the session's
     // vendor. Guards against a tampered gateway_id routing a payment to (and
@@ -599,11 +623,13 @@ async function submitTxn(req, res, next) {
         `INSERT INTO transactions
            (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
             status, result_source, matched_sms, verified_at, payer_name, payer_phone,
-            sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10,$11,$12,$13,$14,$15)
+            sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount,
+            charged_currency)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'success','sms_late_match',$8,NOW(),$9,$10,$11,$12,$13,$14,$15,$16)
          RETURNING id, status, created_at`,
         [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, total, s.customer_phone,
-         sms.body, payer.name, payer.phone, sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit]
+         sms.body, payer.name, payer.phone, sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit,
+         chargedCurrency]
       );
       await pool.query(`UPDATE sms_messages SET matched_tx_id = $1 WHERE id = $2`, [ins.rows[0].id, sms.id]);
       await pool.query(
@@ -624,11 +650,12 @@ async function submitTxn(req, res, next) {
     const r = await pool.query(
       `INSERT INTO transactions
          (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
-          sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount,
+          charged_currency)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING id, status, created_at`,
       [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, totalD, s.customer_phone,
-       sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit]
+       sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit, chargedCurrency]
     );
 
     // Fire-and-forget — never block the customer's response on push delivery.

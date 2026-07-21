@@ -121,6 +121,11 @@ function providersNotAccepting(currency) {
     .map(([provider]) => provider);
 }
 
+/** The currency a rail settles in, or null if we don't model that provider. */
+function railCurrency(provider) {
+  return PROVIDER_CURRENCY[String(provider || '').toLowerCase()] || null;
+}
+
 function isUpiProvider(provider) {
   return UPI_PROVIDERS.includes(String(provider || '').toLowerCase());
 }
@@ -225,6 +230,7 @@ module.exports = {
   VPA_RE,
   PROVIDER_CURRENCY,
   providersNotAccepting,
+  railCurrency,
   isUpiProvider,
   isValidVpa,
   normalizeVpa,

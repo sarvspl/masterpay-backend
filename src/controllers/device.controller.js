@@ -306,7 +306,12 @@ async function poll(req, res, next) {
               g.bank_code,
               s.order_id,
               s.customer_name,
-              s.currency
+              -- What the payer was actually CHARGED in, which is not always what
+              -- the session was priced in: a wallet top-up may be settled
+              -- through a rail that receives another currency. The session
+              -- records the invoice, charged_currency records the payment, and
+              -- the matcher needs the latter.
+              COALESCE(t.charged_currency, s.currency) AS currency
          FROM transactions t
          JOIN gateways g ON g.id = t.gateway_id
          LEFT JOIN payment_sessions s ON s.id = t.session_id
