@@ -439,14 +439,22 @@ async function submitTxn(req, res, next) {
 
     // What identifies the payment, by rail.
     //
-    // Wallet rails put a TrxID in their own confirmation SMS, and the customer
-    // can read it straight off the message. UPI does not: GPay and PhonePe send
-    // nothing, and the bank's 12-digit UTR is buried several screens deep in
-    // both apps, so asking for it loses far more payments than it verifies.
-    // What the vendor's phone DOES receive is an app notification naming the
-    // payer, so for UPI the customer tells us their name instead.
+    // Wallet rails put a TrxID in their own confirmation SMS, so the customer
+    // reads it straight off the message and it is required.
+    //
+    // UPI collects BOTH, because the vendor's phone gets two independent
+    // signals and either can settle the payment:
+    //
+    //   - the bank's SMS, which quotes the 12-digit UTR
+    //   - the GPay/PhonePe notification, which names the payer
+    //
+    // The name is required and the UTR is not, deliberately. The UTR is the
+    // stronger evidence — it is unique, so it can never settle the wrong order —
+    // but it sits several screens deep in both apps and demanding it loses more
+    // payments than it verifies. So: everyone can supply a name, and whoever
+    // also supplies a UTR gets the faster, stronger path.
     const upi = isUpiProvider(gateway.provider);
-    const txnid = upi ? null : txnidRaw;
+    const txnid = txnidRaw || null;
     const payer_name_claimed = upi ? payerNameRaw : null;
 
     if (upi) {
@@ -466,6 +474,11 @@ async function submitTxn(req, res, next) {
     } else if (!txnid) {
       return res.status(400).json({ error: 'Transaction ID is required' });
     }
+
+    // The TxnID-keyed paths below (idempotency, inbound claim, late SMS match)
+    // are meaningful only when there IS one. A UPI payment submitted without a
+    // UTR skips them and is settled by the device instead.
+    const hasTxnid = !!txnid;
 
     // listCheckoutGateways already hides gateways whose min/max excludes this
     // order. Re-check here so a hand-crafted gateway_id can't slip past it.
@@ -522,10 +535,12 @@ async function submitTxn(req, res, next) {
     if (sessionTx.rowCount > 0) {
       const t = sessionTx.rows[0];
       // A UPI row has no TxnID, so "same submission" means the same payer name.
+      // A UPI row is identified by its payer name, which is always present; the
+      // UTR is optional there so it can't be the test.
       const sameSubmission = upi
         ? !!t.payer_name_claimed &&
           t.payer_name_claimed.trim().toLowerCase() === payer_name_claimed.trim().toLowerCase()
-        : !!t.txnid_submitted && t.txnid_submitted.toLowerCase() === txnid.toLowerCase();
+        : !!t.txnid_submitted && !!txnid && t.txnid_submitted.toLowerCase() === txnid.toLowerCase();
       if (!sameSubmission) {
         return res.status(409).json({
           error: upi
@@ -549,7 +564,7 @@ async function submitTxn(req, res, next) {
     //   instead prevented at settlement: uniq_tx_merchant_fingerprint_success
     //   (043) lets a given notification settle exactly one transaction, so a
     //   second order claiming the same payment stays pending for manual review.
-    const existing = upi
+    const existing = !hasTxnid
       ? { rowCount: 0, rows: [] }
       : await pool.query(
           `SELECT id, session_id, status, amount, created_at, failure_reason
@@ -603,7 +618,7 @@ async function submitTxn(req, res, next) {
     //   customer just typed, link it to this session.
     //   Skipped for UPI: inbound rows are created by TxnID from an SMS, and a
     //   UPI payment has neither.
-    const inbound = upi
+    const inbound = !hasTxnid
       ? { rowCount: 0, rows: [] }
       : await pool.query(
           `SELECT id, amount FROM transactions
@@ -648,7 +663,7 @@ async function submitTxn(req, res, next) {
     //   Skipped for UPI: this searches SMS bodies for the TxnID, and a UPI
     //   payment has none. Its equivalent lives on the device, which matches the
     //   payer name against the UPI app's own notification.
-    const smsRows = upi
+    const smsRows = !hasTxnid
       ? { rows: [] }
       : await pool.query(
           `SELECT id, body FROM sms_messages

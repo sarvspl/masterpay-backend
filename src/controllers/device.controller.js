@@ -386,6 +386,16 @@ async function report(req, res, next) {
       : null;
 
     try {
+      // Identifies the SMS/notification that settled this payment. The partial
+      // unique index uniq_tx_merchant_fingerprint_success (043) then makes the
+      // database refuse to let that same payment settle a second order — which
+      // is what replaces the TxnID uniqueness for UPI, where there is no TxnID.
+      // Enforced in the index rather than by a SELECT-then-INSERT so it holds
+      // under a race between two phones or two cycles.
+      const fingerprint = result === 'success'
+        ? (String(req.body.match_fingerprint || '').trim().slice(0, 64) || null)
+        : null;
+
       const upd = await pool.query(
         `UPDATE transactions
             SET status = $1,
@@ -393,6 +403,7 @@ async function report(req, res, next) {
                 result_device_id = $2,
                 matched_sms = $3,
                 failure_reason = $4,
+                match_fingerprint = COALESCE($8, match_fingerprint),
                 verified_at = NOW(),
                 updated_at = NOW()
           WHERE id = $5 AND merchant_id = $6 AND status = 'pending'
@@ -405,6 +416,7 @@ async function report(req, res, next) {
             ? note                                   // optional manual note on approve
             : (note || 'No matching SMS'),           // note (or fallback) on reject
           verification_id, m.rows[0].merchant_id, m.rows[0].account_id,
+          fingerprint,
         ]
       );
       if (upd.rowCount === 0) {
@@ -439,10 +451,24 @@ async function report(req, res, next) {
         },
       });
     } catch (e) {
-      // Another row with the same TxnID is already success for this merchant.
-      // Treat as already-resolved (idempotent) rather than 500ing.
+      // A unique index refused the settlement. Either the same TxnID, or the
+      // same SMS/notification, is already marked paid on another order for this
+      // merchant.
+      //
+      // The fingerprint case is the one that matters for UPI: two orders from
+      // customers with the same name and amount both matched one payment. The
+      // database picks a winner and this one stays PENDING, so a human decides.
+      // That is deliberate — auto-failing it would reject a customer who may
+      // well have paid, and auto-approving would give away goods.
       if (e && e.code === '23505') {
-        return res.status(409).json({ error: 'This Transaction ID is already marked Paid on another order.' });
+        const onFingerprint = /uniq_tx_merchant_fingerprint_success/.test(e.constraint || '');
+        return res.status(409).json({
+          error: onFingerprint
+            ? 'That payment has already been matched to another order. This one needs manual review.'
+            : 'This Transaction ID is already marked Paid on another order.',
+          code: onFingerprint ? 'duplicate_payment_evidence' : 'duplicate_txnid',
+          needs_manual_review: onFingerprint,
+        });
       }
       throw e;
     }
