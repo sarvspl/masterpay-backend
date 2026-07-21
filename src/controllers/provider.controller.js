@@ -2,22 +2,6 @@ const pool = require('../db/pool');
 
 const ID_RE     = /^[a-z][a-z0-9_]{1,38}$/;
 
-/**
- * merchants.country holds display names from frontend/src/lib/countries.js
- * ('India', 'Bangladesh'), but some legacy rows contain ISO codes instead
- * ('IN', 'BD'). Map the known aliases so those merchants still resolve to the
- * right rails instead of silently falling through to the global catalog.
- */
-const COUNTRY_ALIASES = {
-  in: 'India',  ind: 'India',
-  bd: 'Bangladesh', bgd: 'Bangladesh',
-};
-
-function normalizeCountry(raw) {
-  const v = String(raw || '').trim();
-  if (!v) return null;
-  return COUNTRY_ALIASES[v.toLowerCase()] || v;
-}
 const VARIANT_RE = /^[a-z][a-z0-9_]{0,38}$/;
 const COLOR_PALETTE = ['pink','orange','purple','emerald','blue','indigo','red','amber','teal','rose','slate'];
 
@@ -39,37 +23,36 @@ function validateBody(b, isUpdate = false) {
 /* ─── Public (no auth) — used by merchant gateways page ─── */
 async function listPublic(req, res, next) {
   try {
-    // Rule: a merchant sees the providers registered for THEIR country; if their
-    // country has none registered, they fall back to the global (country IS NULL)
-    // catalog.
+    // The whole catalog, regardless of the merchant's registered country.
     //
-    // Concretely: India has gpay/phonepe, so Indian merchants see UPI only and
-    // never bKash/Nagad. Bangladesh has no country-specific providers, so BD
-    // merchants keep seeing the global catalog exactly as before — this is why
-    // 041 left every pre-existing provider at country NULL. Registering a
-    // Bangladesh-specific provider later flips BD over automatically.
+    // Country used to restrict this, on the assumption that a Bangladeshi
+    // business only ever collects through BD rails. That isn't true: a seller
+    // anywhere may hold an Indian bank account and want to take UPI from Indian
+    // customers, and a marketplace may serve both countries. Their registered
+    // address doesn't decide that.
     //
-    // ?country= is a narrowing hint from the gateways page. An authenticated
-    // merchant's own country always wins, so a client cannot request rails it
-    // isn't entitled to.
-    const country = normalizeCountry((req.merchant && req.merchant.country) || req.query.country);
-
+    // What actually stops a mismatched payment is CURRENCY, not country, and
+    // that guard is enforced where it matters rather than here:
+    //
+    //   - listCheckoutGateways hides rails that can't receive the session's
+    //     currency, so a UPI gateway simply never appears on a BDT checkout.
+    //   - submitTxn re-checks it, so a hand-crafted gateway_id can't get past.
+    //   - availabilityFor reports currency_unsupported instead of creating a
+    //     session whose checkout would be empty.
+    //
+    // That guard is real, because the two networks genuinely cannot reach each
+    // other: bKash runs on Bangladesh's rails and UPI on India's NPCI, with no
+    // interoperability. A bKash user cannot pay a UPI QR at all. So configuring
+    // a rail is harmless — being offered one you can't pay is what hurts, and
+    // that is prevented at checkout.
+    //
+    // providers.country is kept as descriptive metadata: the gateway form uses
+    // it to label a rail's region so the choice is informed rather than blocked.
     const { rows } = await pool.query(
       `SELECT id, name, initials, color, variants, country
          FROM providers
         WHERE is_enabled = TRUE
-          AND CASE
-                WHEN EXISTS (
-                  SELECT 1 FROM providers
-                   WHERE is_enabled = TRUE
-                     AND $1::text IS NOT NULL
-                     AND LOWER(country) = LOWER($1)
-                )
-                THEN LOWER(country) = LOWER($1)
-                ELSE country IS NULL
-              END
-        ORDER BY name ASC`,
-      [country]
+        ORDER BY name ASC`
     );
     res.json({ providers: rows });
   } catch (e) { next(e); }
