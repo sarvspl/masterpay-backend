@@ -4,7 +4,7 @@ const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
 const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
-const { isUpiProvider, buildUpiUri, buildAppUri, providersNotAccepting, railCurrency } = require('../utils/upi');
+const { isUpiProvider, buildUpiUri, buildAppUri, providersNotAccepting, railCurrency, isPlatformCollected } = require('../utils/upi');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -285,8 +285,8 @@ async function listCheckoutGateways(req, res, next) {
     // ৳2,020 paid by UPI costs ₹2,020. The checkout states the charge currency
     // per gateway so the choice is explicit rather than a silent overcharge —
     // see charge_currency below and the notice in the UI.
-    const isWalletTopup = s.metadata && s.metadata.type === 'wallet_topup';
-    const excludedProviders = isWalletTopup ? [] : providersNotAccepting(s.currency);
+    const platformCollected = isPlatformCollected(s);
+    const excludedProviders = platformCollected ? [] : providersNotAccepting(s.currency);
 
     const r = await pool.query(
       `WITH picked AS (
@@ -449,11 +449,11 @@ async function submitTxn(req, res, next) {
     // checkout that the charge is taken in the rail's currency. Record which
     // currency was actually charged so the verifier expects the right one — the
     // session records what was invoiced, not what was paid.
-    const isWalletTopup = s.metadata && s.metadata.type === 'wallet_topup';
+    const platformCollected = isPlatformCollected(s);
     const railCur = railCurrency(gateway.provider);
     const crossCurrency = !!railCur && railCur !== String(s.currency).toUpperCase();
 
-    if (!isWalletTopup && providersNotAccepting(s.currency).includes(String(gateway.provider).toLowerCase())) {
+    if (!platformCollected && providersNotAccepting(s.currency).includes(String(gateway.provider).toLowerCase())) {
       return res.status(400).json({ error: `This payment method cannot accept ${s.currency} payments.` });
     }
     const chargedCurrency = crossCurrency ? railCur : null;

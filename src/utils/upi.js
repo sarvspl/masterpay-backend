@@ -126,6 +126,35 @@ function railCurrency(provider) {
   return PROVIDER_CURRENCY[String(provider || '').toLowerCase()] || null;
 }
 
+/**
+ * Sessions where the payer is paying the PLATFORM rather than a vendor:
+ * merchant wallet top-up, vendor wallet top-up, vendor activation fee, and
+ * device-key unlock.
+ *
+ * These are the only checkouts that offer rails settling in another currency.
+ * The payer is a business counterparty choosing how to settle its own bill, and
+ * the checkout states the charge currency plainly — whereas a consumer paying a
+ * vendor must never be shown a rail that takes a different currency than the
+ * price they agreed to.
+ *
+ * Keep in sync with the `type:` values written into payment_sessions.metadata:
+ *   wallet_topup      wallet.controller.js
+ *   vendor_topup      vendor.controller.js
+ *   vendor_activation vendor.controller.js, adminVendors.controller.js, services/activation.js
+ *   key_unlock        accounts.controller.js, merchant.controller.js
+ */
+const PLATFORM_COLLECTED_TYPES = new Set([
+  'wallet_topup',
+  'vendor_topup',
+  'vendor_activation',
+  'key_unlock',
+]);
+
+function isPlatformCollected(session) {
+  const t = session && session.metadata && session.metadata.type;
+  return PLATFORM_COLLECTED_TYPES.has(String(t || ''));
+}
+
 function isUpiProvider(provider) {
   return UPI_PROVIDERS.includes(String(provider || '').toLowerCase());
 }
@@ -231,6 +260,8 @@ module.exports = {
   PROVIDER_CURRENCY,
   providersNotAccepting,
   railCurrency,
+  isPlatformCollected,
+  PLATFORM_COLLECTED_TYPES,
   isUpiProvider,
   isValidVpa,
   normalizeVpa,
