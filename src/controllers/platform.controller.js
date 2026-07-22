@@ -41,12 +41,23 @@ function asPlatformMerchant(handler) {
 async function getInfo(req, res, next) {
   try {
     const id = await getPlatformMerchantId();
+    // device_auth_key MUST come from accounts, not merchant_keys.
+    //
+    // Migration 026 moved the key to accounts and every regeneration path
+    // (accounts / adminVendors / vendor controllers) updates accounts only —
+    // merchant_keys keeps whatever it held at signup. Reading it from there
+    // showed a key that had been dead since the first regeneration, while
+    // /api/device/bind resolves the account by accounts.device_auth_key. The
+    // console displayed one key and the APK required another, so binding
+    // failed with "Invalid device auth key" and the screen gave no clue why.
+    //
+    // merchant_keys is legacy; do not read the key from it anywhere.
     const r = await pool.query(
       `SELECT m.id, m.name, m.wallet_balance, m.currency, m.created_at,
-              k.device_auth_key,
+              a.device_auth_key,
               b.id AS brand_id, b.api_key, b.domain AS brand_domain
          FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
+         LEFT JOIN accounts a ON a.merchant_id = m.id AND a.is_default = TRUE
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
         WHERE m.id = $1`,
       [id]

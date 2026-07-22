@@ -99,11 +99,11 @@ async function listMerchants(req, res, next) {
     const { rows } = await pool.query(
       `SELECT m.id, m.name, m.username, m.mobile, m.email, m.domain, m.industry, m.country, m.state,
               m.currency, m.wallet_balance, m.is_suspended, m.suspended_at, m.suspended_reason, m.created_at,
-              k.device_auth_key,
+              a.device_auth_key,
               b.api_key AS default_api_key,
               (SELECT COUNT(*) FROM brands WHERE merchant_id = m.id) AS brand_count
          FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
+         LEFT JOIN accounts a ON a.merchant_id = m.id AND a.is_default = TRUE
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
          ${whereSql}
         ORDER BY m.created_at DESC
@@ -136,10 +136,10 @@ async function getMerchant(req, res, next) {
     const { rows } = await pool.query(
       `SELECT m.id, m.name, m.username, m.mobile, m.email, m.domain, m.industry, m.country, m.state,
               m.currency, m.wallet_balance, m.is_suspended, m.suspended_at, m.suspended_reason, m.created_at,
-              k.device_auth_key,
+              a.device_auth_key,
               b.api_key AS default_api_key
          FROM merchants m
-         JOIN merchant_keys k ON k.merchant_id = m.id
+         LEFT JOIN accounts a ON a.merchant_id = m.id AND a.is_default = TRUE
          LEFT JOIN brands b ON b.merchant_id = m.id AND b.is_default = TRUE
         WHERE m.id = $1`,
       [req.params.id]
