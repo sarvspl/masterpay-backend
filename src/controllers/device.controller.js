@@ -285,12 +285,28 @@ async function poll(req, res, next) {
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
     const { merchant_id, account_id } = m.rows[0];
 
-    // Touch device last_seen (acts as heartbeat too) — only the active row
-    await pool.query(
+    // The phone must still be BOUND, not merely holding a valid auth key.
+    //
+    // This used to be only the last_seen UPDATE below, which silently matches
+    // zero rows for an unbound device and then carries on — so unbinding a
+    // phone did not actually stop it polling or verifying payments. "Unbind"
+    // in the console was cosmetic, and a removed phone kept confirming money.
+    //
+    // Returning 401 here also gives the APK something it can act on: the key is
+    // fine, the binding is gone, so prompt to re-bind rather than showing a
+    // generic auth failure.
+    const bound = await pool.query(
       `UPDATE devices SET last_seen_at = NOW()
-        WHERE account_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
+        WHERE account_id = $1 AND device_id = $2 AND unbound_at IS NULL
+        RETURNING id`,
       [account_id, device_id]
     );
+    if (bound.rowCount === 0) {
+      return res.status(401).json({
+        error: 'This phone is no longer bound. Open the app and enter the device key again.',
+        code: 'device_unbound',
+      });
+    }
 
     // Account-scoped: a phone only receives verifications for ITS account's
     // gateways (that account's bKash number's SMS lands only on this phone).
@@ -377,6 +393,21 @@ async function report(req, res, next) {
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
+
+    // Same binding check as poll(): an unbound phone must not be able to settle
+    // a payment. Without this, an operator who unbinds a phone in the console
+    // has not actually revoked anything — it can still mark payments as paid.
+    const stillBound = await pool.query(
+      `SELECT 1 FROM devices
+        WHERE account_id = $1 AND device_id = $2 AND unbound_at IS NULL`,
+      [m.rows[0].account_id, device_id]
+    );
+    if (stillBound.rowCount === 0) {
+      return res.status(401).json({
+        error: 'This phone is no longer bound. Open the app and enter the device key again.',
+        code: 'device_unbound',
+      });
+    }
 
     // `failure_reason` is overloaded as a free-form note column across the rest
     // of the codebase (see payment.controller.js manualResolve), so an approve
