@@ -75,6 +75,9 @@ router.delete('/platform/gateways/:id',       requireAdmin, platformCtrl.removeG
 router.get('/platform/devices',               requireAdmin, platformCtrl.listDevices);
 router.get('/platform/devices/history',       requireAdmin, platformCtrl.listDeviceHistory);
 router.delete('/platform/devices/:id',        requireAdmin, platformCtrl.removeDevice);
+// Hard delete of an already-unbound row. Separate path so an unbind can never
+// be mistaken for a purge, and vice versa.
+router.delete('/platform/devices/:id/purge',  requireAdmin, platformCtrl.purgeDevice);
 router.get('/platform/transactions',          requireAdmin, platformCtrl.listTransactions);
 router.post('/platform/transactions/:id/resolve', requireAdmin, platformCtrl.manualResolveTransaction);
 

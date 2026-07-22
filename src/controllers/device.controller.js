@@ -249,16 +249,68 @@ async function listForMerchant(req, res, next) {
 /* ─── Merchant-facing: list past (unbound) devices, newest unbound first ─── */
 async function listHistoryForMerchant(req, res, next) {
   try {
+    // verified_count tells the operator what deleting this row would detach.
+    // transactions.result_device_id stores the device_id STRING (not this row's
+    // uuid) and carries no foreign key, so a delete never errors — it just
+    // leaves those payments naming a phone that no longer exists. Showing the
+    // number is the difference between an informed cleanup and a silent one.
     const { rows } = await pool.query(
-      `SELECT id, device_id, model, manufacturer, os_version,
-              last_seen_at, created_at, unbound_at, unbound_reason
-         FROM devices
-        WHERE merchant_id = $1 AND unbound_at IS NOT NULL
-        ORDER BY unbound_at DESC
+      `SELECT d.id, d.device_id, d.model, d.manufacturer, d.os_version,
+              d.last_seen_at, d.created_at, d.unbound_at, d.unbound_reason,
+              d.binder_name, d.telegram_handle,
+              (SELECT COUNT(*)::int FROM transactions t
+                WHERE t.merchant_id = d.merchant_id
+                  AND t.result_device_id = d.device_id) AS verified_count
+         FROM devices d
+        WHERE d.merchant_id = $1 AND d.unbound_at IS NOT NULL
+        ORDER BY d.unbound_at DESC
         LIMIT 100`,
       [req.merchant.id]
     );
     res.json({ devices: rows });
+  } catch (e) { next(e); }
+}
+
+/**
+ * Permanently remove an unbound device row.
+ *
+ * DELETE /api/admin/platform/devices/:id/purge
+ *
+ * Only unbound rows can be purged. An active phone must be unbound first —
+ * otherwise "delete" would look like it revoked access when the row could be
+ * recreated by the next bind, and the two operations mean different things.
+ *
+ * Nothing references devices by foreign key, so this cannot fail on a
+ * constraint. What it does cost: transactions record which phone verified them
+ * via result_device_id, and once the row is gone that value resolves to nothing
+ * — the payment still shows it was device-verified, but not by which handset,
+ * nor who bound it. Purging a phone that verified nothing loses nothing at all,
+ * which is the common case for a mis-bind or a test device.
+ */
+async function purgeForMerchant(req, res, next) {
+  try {
+    const d = await pool.query(
+      `SELECT id, device_id, unbound_at FROM devices WHERE id = $1 AND merchant_id = $2`,
+      [req.params.id, req.merchant.id]
+    );
+    if (d.rowCount === 0) return res.status(404).json({ error: 'Device not found' });
+    if (d.rows[0].unbound_at === null) {
+      return res.status(409).json({
+        error: 'This phone is still bound. Unbind it first, then delete it.',
+        code: 'device_still_bound',
+      });
+    }
+
+    const used = await pool.query(
+      `SELECT COUNT(*)::int n FROM transactions
+        WHERE merchant_id = $1 AND result_device_id = $2`,
+      [req.merchant.id, d.rows[0].device_id]
+    );
+
+    await pool.query(`DELETE FROM devices WHERE id = $1 AND merchant_id = $2`,
+      [req.params.id, req.merchant.id]);
+
+    res.json({ ok: true, deleted: d.rows[0].device_id, detached_transactions: used.rows[0].n });
   } catch (e) { next(e); }
 }
 
@@ -654,5 +706,5 @@ async function deleteForMerchant(req, res, next) {
 module.exports = {
   bind, unbind, heartbeat, poll, report,
   listTransactionsForDevice, verifyTxnIdFromDevice,
-  listForMerchant, listHistoryForMerchant, updateForMerchant, deleteForMerchant,
+  listForMerchant, listHistoryForMerchant, updateForMerchant, deleteForMerchant, purgeForMerchant,
 };

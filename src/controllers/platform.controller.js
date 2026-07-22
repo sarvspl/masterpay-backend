@@ -335,6 +335,7 @@ module.exports = {
   listDevices:     asPlatformMerchant(deviceCtrl.listForMerchant),
   listDeviceHistory: asPlatformMerchant(deviceCtrl.listHistoryForMerchant),
   removeDevice:    asPlatformMerchant(deviceCtrl.deleteForMerchant),
+  purgeDevice:     asPlatformMerchant(deviceCtrl.purgeForMerchant),
   listTransactions: asPlatformMerchant(paymentCtrl.listTransactions),
   manualResolveTransaction: asPlatformMerchant(paymentCtrl.manualResolve),
 };
