@@ -4,7 +4,7 @@ const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
 const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
-const { isUpiProvider, buildUpiUri, buildAppUri, providersNotAccepting, railCurrency, isPlatformCollected } = require('../utils/upi');
+const { isUpiProvider, buildUpiUri, buildAppUri, railCurrency } = require('../utils/upi');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -272,21 +272,14 @@ async function listCheckoutGateways(req, res, next) {
     // take it, so never offer it — the customer would otherwise pick it and get
     // stuck. A NULL bound means "no limit".
     //
-    // Same reasoning for currency: a rail can only receive one, so a GPay button
-    // on a BDT sale would send the customer to a rail that cannot settle their
-    // order. Filtered in SQL rather than after the fact so a hidden gateway
-    // doesn't get its round-robin last_shown_at bumped.
-    //
-    // EXCEPT wallet top-ups, where every rail is offered. That is a business
-    // paying the platform directly and choosing how to settle, not a consumer
-    // paying a vendor — so the merchant may deliberately pay a taka invoice
-    // through UPI. The amount is NOT converted (there is no FX rate in the
-    // system): the same numeral is charged in the rail's own currency, so
-    // ৳2,020 paid by UPI costs ₹2,020. The checkout states the charge currency
-    // per gateway so the choice is explicit rather than a silent overcharge —
-    // see charge_currency below and the notice in the UI.
-    const platformCollected = isPlatformCollected(s);
-    const excludedProviders = platformCollected ? [] : providersNotAccepting(s.currency);
+    // Currency does NOT filter the list. Every gateway the vendor has is offered
+    // regardless of the order's currency, because the currency a payment is
+    // verified against is decided by the RAIL, not the order: GPay/PhonePe are
+    // always matched as INR, the wallets always as BDT (see PROVIDER_CURRENCY /
+    // currencyForVerification in the matcher). The amount is NOT converted —
+    // there is no FX in the system — so a "500" order paid via UPI costs ₹500
+    // and via bKash costs ৳500, the same numeral in the rail's own currency.
+    // charge_currency below carries that per gateway so checkout can label it.
 
     const r = await pool.query(
       `WITH picked AS (
@@ -295,7 +288,6 @@ async function listCheckoutGateways(req, res, next) {
           WHERE ${scopeCol} = $1 AND is_enabled = TRUE
             AND (min_amount IS NULL OR $2 >= min_amount)
             AND (max_amount IS NULL OR $2 <= max_amount)
-            AND provider <> ALL($3::text[])
           ORDER BY provider, variant, last_shown_at ASC NULLS FIRST, id
        ),
        bumped AS (
@@ -308,7 +300,7 @@ async function listCheckoutGateways(req, res, next) {
                   g.discount_value, g.discount_type, g.vpa
        )
        SELECT * FROM bumped ORDER BY provider ASC, variant ASC`,
-      [scopeVal, Number(s.amount), excludedProviders]
+      [scopeVal, Number(s.amount)]
     );
 
     // Attach the UPI payment payload for India rails.
@@ -488,23 +480,17 @@ async function submitTxn(req, res, next) {
       return res.status(400).json({ error: 'This payment method does not accept this amount.' });
     }
 
-    // Likewise for currency. A rail receives one currency only, so paying a BDT
-    // order into a UPI gateway could never be verified — the bank SMS would be
-    // in rupees and the device would flag it as a misconfiguration.
+    // Currency is decided by the RAIL, not the order — a gateway is never
+    // rejected for the order's currency. GPay/PhonePe are always verified as
+    // INR and the wallets as BDT (PROVIDER_CURRENCY in the matcher). The amount
+    // is not converted: a "500" order paid via UPI is ₹500, via bKash ৳500.
     //
-    // Wallet top-ups are exempt: the merchant is paying the platform and may
-    // deliberately settle a taka invoice through UPI, having been told at
-    // checkout that the charge is taken in the rail's currency. Record which
-    // currency was actually charged so the verifier expects the right one — the
-    // session records what was invoiced, not what was paid.
-    const platformCollected = isPlatformCollected(s);
+    // charged_currency records the rail's currency whenever it differs from what
+    // the order was priced in, so the device poll and the checkout label expect
+    // the right one — the session records what was invoiced, not what was paid.
     const railCur = railCurrency(gateway.provider);
-    const crossCurrency = !!railCur && railCur !== String(s.currency).toUpperCase();
-
-    if (!platformCollected && providersNotAccepting(s.currency).includes(String(gateway.provider).toLowerCase())) {
-      return res.status(400).json({ error: `This payment method cannot accept ${s.currency} payments.` });
-    }
-    const chargedCurrency = crossCurrency ? railCur : null;
+    const chargedCurrency =
+      railCur && railCur !== String(s.currency).toUpperCase() ? railCur : null;
 
     // Vendor-scoped session: the chosen gateway must belong to the session's
     // vendor. Guards against a tampered gateway_id routing a payment to (and

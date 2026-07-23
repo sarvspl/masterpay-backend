@@ -18,7 +18,6 @@
  */
 const pool = require('../db/pool');
 const { getPlatformSettings, computeVendorVerifyFee } = require('./wallet');
-const { providersNotAccepting } = require('../utils/upi');
 
 /* Stable reason codes. Never rename one — integrators branch on these. */
 const REASONS = {
@@ -140,7 +139,7 @@ function vendorWalletCovers(vendor, amount, settings) {
  * integrator always gets the most actionable explanation.
  */
 function evaluateVendor(vendor, gateways, opts) {
-  const { amount, currency, settings } = opts;
+  const { amount, settings } = opts;
 
   // Never registered a panel login → the seller never claimed their code.
   if (vendor.username == null) return unavailable(vendor, REASONS.NOT_REGISTERED);
@@ -156,19 +155,14 @@ function evaluateVendor(vendor, gateways, opts) {
   const enabled = gateways.filter((g) => g.is_enabled);
   if (enabled.length === 0)                      return unavailable(vendor, REASONS.ALL_PAUSED);
 
-  const inRange = enabled.filter((g) => acceptsAmount(g, amount));
-  if (inRange.length === 0)                      return unavailable(vendor, REASONS.AMOUNT_OUT_OF_RANGE);
+  const usable = enabled.filter((g) => acceptsAmount(g, amount));
+  if (usable.length === 0)                       return unavailable(vendor, REASONS.AMOUNT_OUT_OF_RANGE);
 
-  // A rail receives one currency only — a UPI gateway can't settle a BDT order
-  // and a bKash number can't settle an INR one. checkout hides those gateways,
-  // so a vendor holding none that match this currency would leave the customer
-  // on an empty page. Report it here instead, which is the whole point of this
-  // service. A currency we don't model excludes nothing.
-  const blocked = providersNotAccepting(currency);
-  const usable = blocked.length
-    ? inRange.filter((g) => !blocked.includes(String(g.provider).toLowerCase()))
-    : inRange;
-  if (usable.length === 0)                       return unavailable(vendor, REASONS.CURRENCY_UNSUPPORTED);
+  // Currency does NOT gate availability. Every rail is offered regardless of the
+  // order's currency: the currency a payment is verified against is the RAIL's,
+  // not the order's (GPay/PhonePe → INR, wallets → BDT). So a BDT marketplace
+  // whose vendor holds only a UPI gateway is payable — the order is simply
+  // charged in the rail's currency, same numeral, no conversion.
 
   // A vendor pays the per-verification fee from their OWN wallet. If they can't
   // cover it, submitTxn would reject the customer with a 402 after they'd
