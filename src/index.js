@@ -62,6 +62,19 @@ app.use('/api/providers', providerRoutes);
 
 app.get('/api/support', supportCtrl.getPublic);
 
+// Public — the installed app polls this to learn if a newer APK exists. No
+// auth: it carries no secrets, and the app must be able to ask before it has
+// bound. See src/config/appVersion.js.
+app.get('/api/app/version', (_req, res) => {
+  const v = require('./config/appVersion');
+  res.json({
+    latest_version_code: v.latestVersionCode,
+    latest_version_name: v.latestVersionName,
+    min_supported_version_code: v.minSupportedVersionCode,
+    apk_url: v.apkUrl,
+  });
+});
+
 app.use(notFound);
 app.use(errorHandler);
 
