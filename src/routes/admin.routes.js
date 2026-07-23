@@ -40,6 +40,8 @@ router.post('/vendors/:id/onboard',        requireAdmin, vendorsCtrl.onboardVend
 router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
 router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
 router.post('/vendors/:id/regenerate-key', requireAdmin, vendorsCtrl.regenerateVendorDeviceKey);
+router.post('/vendors/:id/suspend',        requireAdmin, vendorsCtrl.suspendVendorAdmin);
+router.post('/vendors/:id/unsuspend',      requireAdmin, vendorsCtrl.unsuspendVendorAdmin);
 
 // The whole business in one call: revenue booked, cash actually received, and
 // the float owed back to merchants and vendors.

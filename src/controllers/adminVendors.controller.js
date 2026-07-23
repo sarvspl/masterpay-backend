@@ -14,6 +14,7 @@
 const bcrypt = require('bcryptjs');
 const pool = require('../db/pool');
 const { generateDeviceAuthKey } = require('../utils/keys');
+const { suspendVendor, unsuspendVendor, suspensionOf } = require('../services/vendors');
 const {
   getPlatformSettings, recordPlatformRevenue,
   computeMerchantCommission, creditMerchantCommission,
@@ -130,6 +131,7 @@ async function loadVendor(id) {
     `SELECT a.id, a.label, a.username, a.external_id, a.device_auth_key,
             a.keys_unlocked, a.activated_at, a.activation_fee, a.wallet_balance,
             a.last_login_at, a.created_at,
+            a.suspended_at, a.suspended_by, a.suspended_reason,
             a.merchant_id, m.name AS merchant_name, m.username AS merchant_username,
             m.is_suspended AS merchant_suspended
        FROM accounts a
@@ -206,6 +208,7 @@ async function getVendor(req, res, next) {
         wallet_balance: Number(v.wallet_balance || 0),
         last_login_at: v.last_login_at,
         created_at: v.created_at,
+        ...suspensionOf(v),   // suspended, suspended_by, suspended_reason, suspended_at
         merchant: {
           id: v.merchant_id,
           name: v.merchant_name,
@@ -583,4 +586,35 @@ async function onboardVendor(req, res, next) {
   }
 }
 
-module.exports = { getVendor, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword, regenerateVendorDeviceKey };
+/* ─── POST /api/admin/vendors/:id/suspend   (admin JWT) ───
+ * Body: { reason? }. A superadmin suspension outranks the merchant: it is
+ * recorded as 'platform', so only a superadmin can later lift it.
+ * merchantId = null → no ownership scoping (a superadmin can suspend anyone).
+ */
+async function suspendVendorAdmin(req, res, next) {
+  try {
+    const r = await suspendVendor(req.params.id, null, {
+      by: 'platform',
+      reason: req.body && req.body.reason,
+    });
+    if (r.notFound) return res.status(404).json({ error: 'Vendor not found' });
+    res.json({ ok: true, vendor_id: req.params.id, already_suspended: !!r.alreadySuspended, ...suspensionOf(r.account) });
+  } catch (e) { next(e); }
+}
+
+/* ─── POST /api/admin/vendors/:id/unsuspend   (admin JWT) ───
+ * A superadmin can lift ANY suspension — merchant-applied or platform-applied.
+ */
+async function unsuspendVendorAdmin(req, res, next) {
+  try {
+    const r = await unsuspendVendor(req.params.id, null, { by: 'platform' });
+    if (r.notFound)     return res.status(404).json({ error: 'Vendor not found' });
+    if (r.notSuspended) return res.json({ ok: true, vendor_id: req.params.id, suspended: false, was_suspended: false });
+    res.json({ ok: true, vendor_id: req.params.id, suspended: false });
+  } catch (e) { next(e); }
+}
+
+module.exports = {
+  getVendor, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword, regenerateVendorDeviceKey,
+  suspendVendorAdmin, unsuspendVendorAdmin,
+};

@@ -22,6 +22,7 @@ const { getPlatformSettings, computeVendorVerifyFee } = require('./wallet');
 /* Stable reason codes. Never rename one — integrators branch on these. */
 const REASONS = {
   NOT_ONBOARDED:       'not_onboarded',
+  SUSPENDED:           'suspended',
   NOT_REGISTERED:      'not_registered',
   NOT_ACTIVATED:       'not_activated',
   NO_GATEWAYS:         'no_gateways',
@@ -55,6 +56,13 @@ function displayFor(reason, vendorLabel) {
         title: 'Online payment paused',
         message: `${who} is not accepting online payment right now.`,
         message_bn: 'এই বিক্রেতা এই মুহূর্তে অনলাইন পেমেন্ট গ্রহণ করছেন না।',
+        suggested_action: 'offer_alternate_method',
+      };
+    case REASONS.SUSPENDED:
+      return {
+        title: 'Seller suspended',
+        message: `${who} is suspended and cannot take payments.`,
+        message_bn: 'এই বিক্রেতা সাসপেন্ড করা হয়েছে এবং পেমেন্ট নিতে পারবেন না।',
         suggested_action: 'offer_alternate_method',
       };
     case REASONS.AMOUNT_OUT_OF_RANGE:
@@ -141,6 +149,10 @@ function vendorWalletCovers(vendor, amount, settings) {
 function evaluateVendor(vendor, gateways, opts) {
   const { amount, settings } = opts;
 
+  // Suspended wins over everything: a suspended vendor can't take a payment no
+  // matter what else is true, so it's checked first.
+  if (vendor.suspended_at) return unavailable(vendor, REASONS.SUSPENDED);
+
   // Never registered a panel login → the seller never claimed their code.
   if (vendor.username == null) return unavailable(vendor, REASONS.NOT_REGISTERED);
 
@@ -212,7 +224,7 @@ async function availabilityFor(merchantId, { ids = [], externalIds = [], amount 
 
   const rows = (ids.length || externalIds.length)
     ? (await pool.query(
-        `SELECT id, label, external_id, username, activated_at, wallet_balance
+        `SELECT id, label, external_id, username, activated_at, wallet_balance, suspended_at
            FROM accounts
           WHERE merchant_id = $1
             AND is_default = FALSE
@@ -220,7 +232,7 @@ async function availabilityFor(merchantId, { ids = [], externalIds = [], amount 
         [merchantId, ids, externalIds]
       )).rows
     : (await pool.query(
-        `SELECT id, label, external_id, username, activated_at, wallet_balance
+        `SELECT id, label, external_id, username, activated_at, wallet_balance, suspended_at
            FROM accounts
           WHERE merchant_id = $1 AND is_default = FALSE
           ORDER BY created_at ASC`,

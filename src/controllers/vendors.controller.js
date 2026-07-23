@@ -15,7 +15,7 @@
  */
 const pool = require('../db/pool');
 const { availabilityFor } = require('../services/availability');
-const { createVendor, serialize } = require('../services/vendors');
+const { createVendor, serialize, suspensionOf, suspendVendor, unsuspendVendor } = require('../services/vendors');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -75,7 +75,8 @@ async function list(req, res, next) {
 async function get(req, res, next) {
   try {
     const a = await pool.query(
-      `SELECT id, label, device_auth_key, external_id, is_default, created_at
+      `SELECT id, label, device_auth_key, external_id, is_default, created_at,
+              suspended_at, suspended_by, suspended_reason
          FROM accounts WHERE id = $1 AND merchant_id = $2`,
       [req.params.id, req.brand.merchant_id]
     );
@@ -92,7 +93,12 @@ async function get(req, res, next) {
     );
 
     res.json({
-      vendor: { ...serialize(a.rows[0]), gateways: g.rows, bound_devices: d.rows[0].n },
+      vendor: {
+        ...serialize(a.rows[0]),
+        ...suspensionOf(a.rows[0]),
+        gateways: g.rows,
+        bound_devices: d.rows[0].n,
+      },
     });
   } catch (e) { next(e); }
 }
@@ -146,4 +152,44 @@ async function availability(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { create, list, get, availability };
+/* ─── POST /api/vendors/:id/suspend   (X-API-Key) ───
+ * Body: { reason? }
+ * The marketplace suspends its own seller. A suspended vendor can't take
+ * payments (availability reports it, session creation is refused, and their
+ * bound phone stops verifying). Recorded as a 'merchant' suspension, so the
+ * merchant — or a superadmin — can later lift it.
+ */
+async function suspend(req, res, next) {
+  try {
+    const r = await suspendVendor(req.params.id, req.brand.merchant_id, {
+      by: 'merchant',
+      reason: req.body && req.body.reason,
+    });
+    if (r.notFound) return res.status(404).json({ error: 'Vendor not found' });
+    res.json({
+      ok: true,
+      vendor_id: req.params.id,
+      already_suspended: !!r.alreadySuspended,
+      ...suspensionOf(r.account),
+    });
+  } catch (e) { next(e); }
+}
+
+/* ─── POST /api/vendors/:id/unsuspend   (X-API-Key) ───
+ * Lift a suspension the MERCHANT applied. A suspension a superadmin applied
+ * cannot be lifted here — it returns 403; only a superadmin can revoke it.
+ */
+async function unsuspend(req, res, next) {
+  try {
+    const r = await unsuspendVendor(req.params.id, req.brand.merchant_id, { by: 'merchant' });
+    if (r.notFound)     return res.status(404).json({ error: 'Vendor not found' });
+    if (r.forbidden)    return res.status(403).json({
+      error: 'This vendor was suspended by MASTER PAY and can only be reinstated by MASTER PAY support.',
+      code: 'suspended_by_platform',
+    });
+    if (r.notSuspended) return res.json({ ok: true, vendor_id: req.params.id, suspended: false, was_suspended: false });
+    res.json({ ok: true, vendor_id: req.params.id, suspended: false });
+  } catch (e) { next(e); }
+}
+
+module.exports = { create, list, get, availability, suspend, unsuspend };

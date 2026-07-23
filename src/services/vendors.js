@@ -113,4 +113,93 @@ async function isVendorAccount(accountId) {
   return !a.is_default && (a.external_id != null || a.username != null);
 }
 
-module.exports = { createVendor, isVendorAccount, serialize };
+/**
+ * Suspension state for API responses. suspended_at IS NULL → not suspended.
+ */
+function suspensionOf(row) {
+  if (!row || !row.suspended_at) return { suspended: false };
+  return {
+    suspended: true,
+    suspended_by: row.suspended_by || null,        // 'merchant' | 'platform'
+    suspended_reason: row.suspended_reason || null,
+    suspended_at: row.suspended_at,
+  };
+}
+
+/**
+ * Suspend a vendor account.
+ *
+ * @param by 'merchant' | 'platform' — recorded so the revoke rule can be
+ *           enforced later. Already-suspended is a no-op that PRESERVES the
+ *           existing owner: a merchant suspend never downgrades a superadmin
+ *           suspension, and re-suspending doesn't change who owns it. That's the
+ *           "whoever suspended first owns it; the other just sees it" model.
+ *
+ * Returns { account } (the fresh row) or { notFound: true }.
+ */
+async function suspendVendor(vendorId, merchantId, { by, reason } = {}) {
+  // Scope: the vendor must belong to this merchant (for the merchant path).
+  // Superadmin passes merchantId = null to skip the ownership clause.
+  const where = merchantId
+    ? 'id = $1 AND merchant_id = $2 AND is_default = FALSE'
+    : 'id = $1 AND is_default = FALSE';
+  const params = merchantId ? [vendorId, merchantId] : [vendorId];
+
+  const cur = await pool.query(`SELECT id, suspended_at, suspended_by, suspended_reason FROM accounts WHERE ${where}`, params);
+  if (cur.rowCount === 0) return { notFound: true };
+
+  // Already suspended → return as-is, owner unchanged.
+  if (cur.rows[0].suspended_at) {
+    return { account: cur.rows[0], alreadySuspended: true };
+  }
+
+  const upd = await pool.query(
+    `UPDATE accounts
+        SET suspended_at = NOW(), suspended_by = $2, suspended_reason = $3
+      WHERE id = $1
+      RETURNING id, suspended_at, suspended_by, suspended_reason`,
+    [vendorId, by, (reason || null) && String(reason).slice(0, 255)]
+  );
+  return { account: upd.rows[0] };
+}
+
+/**
+ * Lift a suspension.
+ *
+ * @param by 'merchant' | 'platform' — the caller's authority. A merchant may
+ *           lift ONLY a merchant-applied suspension; a superadmin may lift any.
+ *           Returns { forbidden: true } when a merchant tries to lift a platform
+ *           suspension.
+ *
+ * Returns { account } | { notFound: true } | { forbidden: true } | { notSuspended: true }.
+ */
+async function unsuspendVendor(vendorId, merchantId, { by } = {}) {
+  const where = merchantId
+    ? 'id = $1 AND merchant_id = $2 AND is_default = FALSE'
+    : 'id = $1 AND is_default = FALSE';
+  const params = merchantId ? [vendorId, merchantId] : [vendorId];
+
+  const cur = await pool.query(`SELECT id, suspended_at, suspended_by FROM accounts WHERE ${where}`, params);
+  if (cur.rowCount === 0) return { notFound: true };
+  if (!cur.rows[0].suspended_at) return { notSuspended: true };
+
+  // A superadmin outranks the merchant and can lift anything. A merchant can
+  // only lift what the merchant applied.
+  if (by === 'merchant' && cur.rows[0].suspended_by === 'platform') {
+    return { forbidden: true };
+  }
+
+  const upd = await pool.query(
+    `UPDATE accounts
+        SET suspended_at = NULL, suspended_by = NULL, suspended_reason = NULL
+      WHERE id = $1
+      RETURNING id, suspended_at, suspended_by, suspended_reason`,
+    [vendorId]
+  );
+  return { account: upd.rows[0] };
+}
+
+module.exports = {
+  createVendor, isVendorAccount, serialize,
+  suspensionOf, suspendVendor, unsuspendVendor,
+};

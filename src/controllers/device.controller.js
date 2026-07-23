@@ -168,10 +168,20 @@ async function heartbeat(req, res, next) {
           AND d.device_id = $1
           AND a.device_auth_key = $2
           AND d.unbound_at IS NULL
-        RETURNING d.id, d.merchant_id, d.account_id`,
+        RETURNING d.id, d.merchant_id, d.account_id, a.suspended_at`,
       [device_id, auth_key]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Device not bound' });
+
+    // A suspended vendor's phone must stop verifying — no pending work is
+    // returned while the account is suspended, whoever suspended it.
+    if (r.rows[0].suspended_at) {
+      return res.status(403).json({
+        error: 'This seller account is suspended. Payments cannot be verified until it is reinstated.',
+        code: 'vendor_suspended',
+        suspended: true,
+      });
+    }
 
     // Attach the wallet snapshot of the ACCOUNT this phone is bound to, so the
     // APK's balance pill shows the holder's own balance. A vendor's phone used
@@ -328,7 +338,7 @@ async function poll(req, res, next) {
     }
 
     const m = await pool.query(
-      `SELECT m.id AS merchant_id, a.id AS account_id
+      `SELECT m.id AS merchant_id, a.id AS account_id, a.suspended_at
          FROM accounts a
          JOIN merchants m ON m.id = a.merchant_id
         WHERE a.device_auth_key = $1`,
@@ -336,6 +346,15 @@ async function poll(req, res, next) {
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
     const { merchant_id, account_id } = m.rows[0];
+
+    // A suspended vendor's phone must stop verifying, whoever suspended it.
+    if (m.rows[0].suspended_at) {
+      return res.status(403).json({
+        error: 'This seller account is suspended. Payments cannot be verified until it is reinstated.',
+        code: 'vendor_suspended',
+        suspended: true,
+      });
+    }
 
     // The phone must still be BOUND, not merely holding a valid auth key.
     //
@@ -438,13 +457,22 @@ async function report(req, res, next) {
     }
 
     const m = await pool.query(
-      `SELECT m.id AS merchant_id, a.id AS account_id
+      `SELECT m.id AS merchant_id, a.id AS account_id, a.suspended_at
          FROM accounts a
          JOIN merchants m ON m.id = a.merchant_id
         WHERE a.device_auth_key = $1`,
       [auth_key]
     );
     if (m.rowCount === 0) return res.status(401).json({ error: 'Invalid device auth key' });
+
+    // A suspended vendor cannot settle a payment — same rule as poll().
+    if (m.rows[0].suspended_at) {
+      return res.status(403).json({
+        error: 'This seller account is suspended. Payments cannot be verified until it is reinstated.',
+        code: 'vendor_suspended',
+        suspended: true,
+      });
+    }
 
     // Same binding check as poll(): an unbound phone must not be able to settle
     // a payment. Without this, an operator who unbinds a phone in the console

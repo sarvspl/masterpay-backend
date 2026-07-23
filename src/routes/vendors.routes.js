@@ -21,6 +21,11 @@ router.get('/availability', requireApiKey, ctrl.availability);
 
 router.get('/:id', requireApiKey, ctrl.get);
 
+// A marketplace can suspend/reinstate its own seller. Unsuspend only lifts a
+// suspension the MERCHANT applied — a platform (superadmin) suspension 403s.
+router.post('/:id/suspend',   requireApiKey, ctrl.suspend);
+router.post('/:id/unsuspend', requireApiKey, ctrl.unsuspend);
+
 // Vendor payment numbers are READ-ONLY to the marketplace. A vendor's bKash /
 // Nagad numbers belong to the vendor and are managed only in their own panel
 // (/api/vendor/gateways). The marketplace operator can see them, so they can
