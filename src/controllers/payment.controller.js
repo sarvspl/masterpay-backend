@@ -417,8 +417,10 @@ async function submitTxn(req, res, next) {
     // file itself is only written once we know we'll create/link a transaction.
     const senderRaw      = String(req.body.sender_account || '').trim();
     const sender_account = /^[0-9+\-\s]{4,40}$/.test(senderRaw) ? senderRaw : null;
+    // Screenshot is OPTIONAL. Verification is automatic from the bank SMS /
+    // notification, so the proof is only kept as evidence for the manual-review
+    // path when it's supplied. An empty string stores NULL.
     const proof_image    = typeof req.body.proof_image === 'string' ? req.body.proof_image : '';
-    if (!proof_image)    return res.status(400).json({ error: 'Payment screenshot is required' });
 
     // Validate gateway belongs to this merchant
     const g = await pool.query(
