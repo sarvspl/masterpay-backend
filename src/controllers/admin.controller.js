@@ -199,6 +199,10 @@ async function getMerchant(req, res, next) {
       merchant: {
         ...r,
         api_key_masked: maskKey(r.default_api_key, 4),
+        // Full key sent to the superadmin console so it can be revealed and
+        // copied (e.g. to re-hand a merchant their integration key). The UI
+        // keeps it masked by default; this only reaches an authenticated admin.
+        api_key: r.default_api_key,
         default_api_key: undefined,
         // The Primary account's device_auth_key is not surfaced: a marketplace
         // has no phone to bind. Each vendor's key lives on their own record.
