@@ -327,9 +327,13 @@ async function listCheckoutGateways(req, res, next) {
       if (!isUpiProvider(g.provider) || !g.vpa) return g;
       const total = computeGatewayTotal(Number(s.amount), g);
       try {
+        // Deliberately NO payee name (pn). GPay/PhonePe resolve the real
+        // registered name from the VPA and DISPLAY that — so sending our own
+        // pn (the marketplace name) creates a mismatch the app reads as
+        // tampering and declines "for security reasons". Omitting pn lets the
+        // app show the account's true name and removes that trigger.
         const upi_uri = buildUpiUri({
           vpa: g.vpa,
-          payeeName: s.merchant_name,
           amount: total,
           note: s.order_id ? `Order ${s.order_id}` : null,
         });
