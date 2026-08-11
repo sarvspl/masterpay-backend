@@ -199,12 +199,24 @@ async function create(req, res, next) {
 
     const account_number = String(req.body.account_number).trim();
 
+    // Only one number per (account, provider, variant) may be enabled at a time.
+    // If the account already has an active one for this slot, the new number is
+    // added DISABLED so it doesn't silently steal the active slot — the vendor
+    // flips it on when ready, and that switch disables the previous one (toggle).
+    const active = await pool.query(
+      `SELECT 1 FROM gateways
+        WHERE account_id = $1 AND provider = $2 AND variant = $3 AND is_enabled = TRUE
+        LIMIT 1`,
+      [account_id, provider, variant]
+    );
+    const startEnabled = active.rowCount === 0;
+
     const r = await pool.query(
       `INSERT INTO gateways (
          merchant_id, account_id, provider, variant, account_number, label,
          min_amount, max_amount, charge_value, charge_type,
-         discount_value, discount_type, balance_check, vpa, bank_code
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         discount_value, discount_type, balance_check, vpa, bank_code, is_enabled
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING *`,
       [
         req.merchant.id, account_id, provider, variant, account_number,
@@ -215,6 +227,7 @@ async function create(req, res, next) {
         !!req.body.balance_check,
         upi ? extractVpa(req.body.vpa) : null,
         upi && req.body.bank_code ? String(req.body.bank_code).toLowerCase() : null,
+        startEnabled,
       ]
     );
     const gateway = r.rows[0];
@@ -222,8 +235,10 @@ async function create(req, res, next) {
     res.status(201).json({ gateway, retroactively_matched: 0 });
   } catch (e) {
     if (e.code === '23505') {
-      // The (account_id, provider, variant) unique index — one of each pair per account.
-      return res.status(409).json({ error: 'This account already has a gateway for this provider and type. Each account allows one per provider+variant.' });
+      // Race: the partial unique index (one ENABLED per provider+variant) caught
+      // a concurrent enable between our active-check and insert. Rare (a single
+      // vendor clicking Add); ask them to retry — the new number lands disabled.
+      return res.status(409).json({ error: 'Another number for this provider was just activated. Please try adding this one again — it will be added paused.' });
     }
     next(e);
   }
@@ -289,16 +304,53 @@ async function update(req, res, next) {
 }
 
 async function toggle(req, res, next) {
+  // Only one number per (account, provider, variant) may be enabled at a time.
+  // Turning a paused number ON therefore switches: it disables whichever sibling
+  // is currently active, then enables this one — atomically, so the partial
+  // unique index never sees two enabled rows. Turning one OFF is a plain flip.
+  const client = await pool.connect();
   try {
-    const r = await pool.query(
-      `UPDATE gateways SET is_enabled = NOT is_enabled, updated_at = NOW()
+    await client.query('BEGIN');
+    const cur = await client.query(
+      `SELECT account_id, provider, variant, is_enabled
+         FROM gateways
         WHERE id = $1 AND merchant_id = $2
-        RETURNING id, is_enabled`,
+        FOR UPDATE`,
       [req.params.id, req.merchant.id]
     );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Gateway not found' });
-    res.json({ id: r.rows[0].id, is_enabled: r.rows[0].is_enabled });
-  } catch (e) { next(e); }
+    if (cur.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Gateway not found' });
+    }
+    const g = cur.rows[0];
+    let switched = null;
+    if (!g.is_enabled) {
+      // Enabling: disable the current active sibling first (the auto-switch).
+      const off = await client.query(
+        `UPDATE gateways SET is_enabled = FALSE, updated_at = NOW()
+          WHERE account_id = $1 AND provider = $2 AND variant = $3
+            AND is_enabled = TRUE AND id <> $4
+          RETURNING id`,
+        [g.account_id, g.provider, g.variant, req.params.id]
+      );
+      switched = off.rows[0]?.id || null;
+    }
+    const r = await client.query(
+      `UPDATE gateways SET is_enabled = NOT is_enabled, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, is_enabled`,
+      [req.params.id]
+    );
+    await client.query('COMMIT');
+    // switched_off tells the UI which sibling flipped off, so it can update both
+    // rows without a refetch.
+    res.json({ id: r.rows[0].id, is_enabled: r.rows[0].is_enabled, switched_off: switched });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    next(e);
+  } finally {
+    client.release();
+  }
 }
 
 async function remove(req, res, next) {
