@@ -9,6 +9,7 @@ const {
 } = require('../utils/keys');
 const { generateUniqueUsername } = require('../utils/username');
 const { currencyForCountry } = require('../utils/currency');
+const { getPlatformSettings } = require('../services/wallet');
 const { COOKIE_NAMES, setSessionCookie, clearSessionCookie } = require('../utils/cookies');
 
 const USERNAME_RE = /^[a-z0-9_]{3,40}$/;
@@ -178,13 +179,21 @@ async function getMerchant(req, res, next) {
         ORDER BY a.created_at ASC`,
       [req.params.id]
     );
+    // "Activated" means the vendor has passed the activation gate. The gate only
+    // exists when the platform charges an activation fee — with the fee at 0
+    // (0 = no activation gate) a vendor is never asked to pay, so activated_at is
+    // never stamped and would forever read "Not activated" here. Mirror the
+    // fee-aware rule the Vendors list already uses (adminVendors.statusOf): a
+    // registered vendor is activated when activated_at is set OR the fee is 0.
+    const settings = await getPlatformSettings().catch(() => ({}));
+    const activationFee = Number(settings.vendor_activation_fee || 0);
     const vendors = vendorsRes.rows.map((v) => ({
       id: v.id,
       label: v.label,
       username: v.username,
       external_id: v.external_id,
       has_login: v.username != null,
-      is_activated: v.activated_at != null,
+      is_activated: v.username != null && (v.activated_at != null || activationFee <= 0),
       activated_at: v.activated_at,
       wallet_balance: Number(v.wallet_balance || 0),
       gateway_count: v.gateway_count,
