@@ -16,8 +16,9 @@ function asMerchant(req, _res, next) {
 router.post('/', requireApiKey, ctrl.create);
 router.get ('/', requireApiKey, ctrl.list);
 
-// MUST precede '/:id' — otherwise Express matches "availability" as a vendor id.
+// MUST precede '/:id' — otherwise Express matches these as a vendor id.
 router.get('/availability', requireApiKey, ctrl.availability);
+router.get('/device-key',   requireApiKey, ctrl.deviceKey);
 
 router.get('/:id', requireApiKey, ctrl.get);
 

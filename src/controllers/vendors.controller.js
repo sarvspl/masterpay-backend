@@ -103,6 +103,49 @@ async function get(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── GET /api/vendors/device-key ───
+ * Fetch a vendor's CURRENT device auth key. Query: ?vendor_id=… OR ?external_id=…
+ *
+ * The device key is the credential the seller uses to bind their phone and claim
+ * their panel at /vendor/register. A marketplace should NOT cache it as a
+ * permanent value: it can be rotated (by the seller in their panel, or by
+ * support), which invalidates the old one. Read it live from here whenever you
+ * show it to a seller — pass whichever id you stored.
+ */
+async function deviceKey(req, res, next) {
+  try {
+    const vendorId = req.query.vendor_id ? String(req.query.vendor_id).trim() : '';
+    const externalId = req.query.external_id ? String(req.query.external_id).trim() : '';
+    if (!vendorId && !externalId) {
+      return res.status(400).json({ error: 'Pass vendor_id or external_id' });
+    }
+    if (vendorId && !UUID_RE.test(vendorId)) {
+      return res.status(400).json({ error: 'vendor_id is not a valid id' });
+    }
+
+    // Scoped to the caller's merchant and to non-Primary accounts (vendors), so a
+    // marketplace can only read the keys of its own sellers.
+    const params = [req.brand.merchant_id];
+    let where = 'merchant_id = $1 AND is_default = FALSE';
+    if (vendorId) { params.push(vendorId); where += ` AND id = $${params.length}`; }
+    else          { params.push(externalId); where += ` AND external_id = $${params.length}`; }
+
+    const r = await pool.query(
+      `SELECT id, label, external_id, device_auth_key FROM accounts WHERE ${where}`,
+      params
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Vendor not found' });
+
+    const v = r.rows[0];
+    res.json({
+      vendor_id:       v.id,
+      external_id:     v.external_id || null,
+      label:           v.label,
+      device_auth_key: v.device_auth_key,
+    });
+  } catch (e) { next(e); }
+}
+
 /* ─── GET /api/vendors/availability ───
  * Query: ?vendor_ids=a,b  ?external_ids=seller_07,seller_88  ?amount=1200
  *
@@ -192,4 +235,4 @@ async function unsuspend(req, res, next) {
   } catch (e) { next(e); }
 }
 
-module.exports = { create, list, get, availability, suspend, unsuspend };
+module.exports = { create, list, get, deviceKey, availability, suspend, unsuspend };
