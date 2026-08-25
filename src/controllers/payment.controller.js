@@ -883,11 +883,27 @@ async function listTransactions(req, res, next) {
       ? req.query.status : null;
     const q = req.query.q ? String(req.query.q).trim() : null;
     const limit = Math.min(200, Number(req.query.limit) || 50);
+    // Page is opt-in: callers that don't pass it get page 1 and the same rows as
+    // before. `total`/`pages` are always returned now (additive — existing
+    // callers ignore them), so a paginated UI knows how many pages exist.
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const offset = (page - 1) * limit;
 
     const accountId = req.query.account_id ? String(req.query.account_id) : null;
     const deviceId  = req.query.device_id  ? String(req.query.device_id)  : null;
 
+    // Filter conditions shared by the row query and the COUNT — built once so the
+    // two can never drift. References a (accounts), s (sessions), g (gateways), t.
     const params = [req.merchant.id];
+    let filter = '';
+    if (req.hideVendorTxns) {
+      filter += ` AND NOT (a.is_default = FALSE AND (a.external_id IS NOT NULL OR a.username IS NOT NULL))`;
+    }
+    if (status)    { params.push(status); filter += ` AND t.status = $${params.length}`; }
+    if (q)         { params.push(`%${q.toLowerCase()}%`); filter += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
+    if (accountId) { params.push(accountId); filter += ` AND g.account_id = $${params.length}`; }
+    if (deviceId)  { params.push(deviceId);  filter += ` AND t.result_device_id = $${params.length}`; }
+
     let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
                       t.result_source, t.result_device_id, t.verified_at, t.failure_reason, t.created_at,
                       t.payer_name, t.payer_phone, t.sender_account, t.proof_image_url, t.matched_sms,
@@ -910,19 +926,22 @@ async function listTransactions(req, res, next) {
                 WHERE t.merchant_id = $1`;
     // A marketplace operator must not see its sellers' payments — those are the
     // vendor's business (customer numbers, transaction ids, proof screenshots).
-    // Set by the merchant-dashboard route only; the vendor panel and the admin
-    // console reach this same controller and must keep seeing their own rows.
-    if (req.hideVendorTxns) {
-      sql += ` AND NOT (a.is_default = FALSE AND (a.external_id IS NOT NULL OR a.username IS NOT NULL))`;
-    }
-    if (status)    { params.push(status); sql += ` AND t.status = $${params.length}`; }
-    if (q)         { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
-    if (accountId) { params.push(accountId); sql += ` AND g.account_id = $${params.length}`; }
-    if (deviceId)  { params.push(deviceId);  sql += ` AND t.result_device_id = $${params.length}`; }
-    sql += ` ORDER BY t.created_at DESC LIMIT ${limit}`;
+    // The hideVendorTxns / status / q / account / device conditions live in
+    // `filter` above so the COUNT below applies exactly the same ones.
+    sql += filter + ` ORDER BY t.created_at DESC LIMIT ${limit} OFFSET ${offset}`;
 
-    const r = await pool.query(sql, params);
-    res.json({ transactions: r.rows });
+    // COUNT uses only the joins the filter references (g, a, s) — the display-only
+    // LEFT JOINs (va, vt, d, b) are omitted so they can't inflate the count.
+    const countSql = `SELECT COUNT(*)::int AS n
+                        FROM transactions t
+                        JOIN gateways g ON g.id = t.gateway_id
+                        LEFT JOIN accounts a ON a.id = g.account_id
+                        LEFT JOIN payment_sessions s ON s.id = t.session_id
+                       WHERE t.merchant_id = $1` + filter;
+
+    const [r, c] = await Promise.all([pool.query(sql, params), pool.query(countSql, params)]);
+    const total = c.rows[0].n;
+    res.json({ transactions: r.rows, total, page, pages: Math.max(1, Math.ceil(total / limit)), limit });
   } catch (e) { next(e); }
 }
 
