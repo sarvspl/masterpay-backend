@@ -615,9 +615,19 @@ async function listTransactionsForDevice(req, res, next) {
     const status = ['pending', 'success', 'failed'].includes(req.body.status) ? req.body.status : null;
     const q = req.body.q ? String(req.body.q).trim() : null;
     const limit = Math.min(200, Number(req.body.limit) || 50);
+    // Page is opt-in: old app builds omit it and get page 1 + the same rows as
+    // before. total/pages are always returned (additive) so a paginating app can
+    // load-more without guessing when to stop.
+    const page = Math.max(1, parseInt(req.body.page, 10) || 1);
+    const offset = (page - 1) * limit;
 
+    // Filter conditions shared by the row query and its COUNT.
     const params = [merchant.merchant_id];
-    let sql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
+    let filter = '';
+    if (status) { params.push(status); filter += ` AND t.status = $${params.length}`; }
+    if (q)      { params.push(`%${q.toLowerCase()}%`); filter += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
+
+    const rowsSql = `SELECT t.id, t.session_id, t.txnid_submitted, t.amount, t.status, t.customer_phone,
                       t.result_source, t.verified_at, t.failure_reason, t.created_at,
                       t.payer_name, t.payer_phone,
                       g.provider, g.variant, g.account_number, g.label AS gateway_label,
@@ -625,13 +635,17 @@ async function listTransactionsForDevice(req, res, next) {
                  FROM transactions t
                  JOIN gateways g ON g.id = t.gateway_id
                  LEFT JOIN payment_sessions s ON s.id = t.session_id
-                WHERE t.merchant_id = $1`;
-    if (status) { params.push(status); sql += ` AND t.status = $${params.length}`; }
-    if (q)      { params.push(`%${q.toLowerCase()}%`); sql += ` AND (LOWER(t.txnid_submitted) LIKE $${params.length} OR LOWER(s.order_id) LIKE $${params.length})`; }
-    sql += ` ORDER BY t.created_at DESC LIMIT ${limit}`;
+                WHERE t.merchant_id = $1` + filter + ` ORDER BY t.created_at DESC LIMIT ${limit} OFFSET ${offset}`;
 
-    const r = await pool.query(sql, params);
-    res.json({ transactions: r.rows });
+    const countSql = `SELECT COUNT(*)::int AS n
+                        FROM transactions t
+                        JOIN gateways g ON g.id = t.gateway_id
+                        LEFT JOIN payment_sessions s ON s.id = t.session_id
+                       WHERE t.merchant_id = $1` + filter;
+
+    const [r, c] = await Promise.all([pool.query(rowsSql, params), pool.query(countSql, params)]);
+    const total = c.rows[0].n;
+    res.json({ transactions: r.rows, total, page, pages: Math.max(1, Math.ceil(total / limit)), limit });
   } catch (e) { next(e); }
 }
 
