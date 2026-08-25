@@ -225,6 +225,60 @@ async function getVendor(req, res, next) {
   } catch (e) { next(e); }
 }
 
+/* ─── GET /api/admin/vendors/:id/activity ───
+ * Paginated + searchable feed for one of the vendor-detail tabs. getVendor still
+ * embeds the first 50 of each for the initial paint; this backs the search box
+ * and pager once the admin wants more than that or filters. Query:
+ *   ?tab=received|paid|ledger  ?q=<free text>  ?page=1
+ * Returns { tab, rows, total, page, pages, limit }.
+ */
+const ACTIVITY_PAGE_SIZE = 25;
+async function getVendorActivity(req, res, next) {
+  try {
+    const v = await loadVendor(req.params.id);
+    if (!v) return res.status(404).json({ error: 'Vendor not found' });
+
+    const tab = ['received', 'paid', 'ledger'].includes(req.query.tab) ? req.query.tab : 'received';
+    const q = req.query.q ? String(req.query.q).trim().toLowerCase() : '';
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = ACTIVITY_PAGE_SIZE;
+    const offset = (page - 1) * limit;
+    const params = q ? [v.id, `%${q}%`] : [v.id];
+
+    let base, cols;
+    if (tab === 'received') {
+      base = `FROM transactions t
+              JOIN gateways g ON g.id = t.gateway_id
+              LEFT JOIN payment_sessions s ON s.id = t.session_id
+             WHERE g.account_id = $1`
+        + (q ? ` AND (LOWER(t.txnid_submitted) LIKE $2 OR LOWER(s.order_id) LIKE $2
+                      OR LOWER(t.sender_account) LIKE $2 OR CAST(t.amount AS TEXT) LIKE $2
+                      OR LOWER(t.status) LIKE $2)` : '');
+      cols = `t.id, t.txnid_submitted, t.amount, t.status, t.result_source,
+              t.sender_account, t.failure_reason, t.verified_at, t.created_at,
+              g.provider, g.variant, g.account_number, s.order_id`;
+    } else if (tab === 'paid') {
+      base = `FROM transactions
+             WHERE (activation_account_id = $1 OR vendor_topup_account_id = $1)`
+        + (q ? ` AND (LOWER(txnid_submitted) LIKE $2 OR CAST(amount AS TEXT) LIKE $2 OR LOWER(status) LIKE $2)` : '');
+      cols = `id, amount, status, txnid_submitted, created_at, verified_at,
+              (activation_account_id IS NOT NULL) AS is_activation`;
+    } else { // ledger
+      base = `FROM wallet_ledger WHERE account_id = $1`
+        + (q ? ` AND (LOWER(note) LIKE $2 OR LOWER(kind) LIKE $2 OR CAST(amount AS TEXT) LIKE $2)` : '');
+      cols = `id, amount, kind, note, created_at`;
+    }
+
+    const orderCol = tab === 'received' ? 't.created_at' : 'created_at';
+    const [rows, count] = await Promise.all([
+      pool.query(`SELECT ${cols} ${base} ORDER BY ${orderCol} DESC LIMIT ${limit} OFFSET ${offset}`, params),
+      pool.query(`SELECT COUNT(*)::int AS n ${base}`, params),
+    ]);
+    const total = count.rows[0].n;
+    res.json({ tab, rows: rows.rows, total, page, pages: Math.max(1, Math.ceil(total / limit)), limit });
+  } catch (e) { next(e); }
+}
+
 /* ─── POST /api/admin/vendors/:id/wallet ───
  * body: { amount, note? }  — a CREDIT only. `amount` must be positive.
  *
@@ -615,6 +669,6 @@ async function unsuspendVendorAdmin(req, res, next) {
 }
 
 module.exports = {
-  getVendor, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword, regenerateVendorDeviceKey,
+  getVendor, getVendorActivity, listVendors, onboardVendor, creditVendorWallet, resetVendorPassword, regenerateVendorDeviceKey,
   suspendVendorAdmin, unsuspendVendorAdmin,
 };

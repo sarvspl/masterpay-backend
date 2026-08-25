@@ -36,6 +36,7 @@ router.post('/merchants/:id/reset-password', requireAdmin, ctrl.resetMerchantPas
 // The wallet route is a top-up: credit only, never a debit.
 router.get ('/vendors',                    requireAdmin, vendorsCtrl.listVendors);
 router.get ('/vendors/:id',                requireAdmin, vendorsCtrl.getVendor);
+router.get ('/vendors/:id/activity',       requireAdmin, vendorsCtrl.getVendorActivity);
 router.post('/vendors/:id/onboard',        requireAdmin, vendorsCtrl.onboardVendor);
 router.post('/vendors/:id/wallet',         requireAdmin, vendorsCtrl.creditVendorWallet);
 router.post('/vendors/:id/reset-password', requireAdmin, vendorsCtrl.resetVendorPassword);
