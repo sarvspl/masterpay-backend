@@ -16,6 +16,16 @@ const { notFound, errorHandler } = require('./middleware/error');
 
 const app = express();
 
+// We sit behind nginx, so the socket peer is always the proxy (127.0.0.1).
+// Without this, req.ip is that proxy address for EVERY request, which made the
+// per-IP rate limiters (login especially) key every visitor to one bucket — a
+// global 8-attempts/15-min lock that shut everyone out platform-wide. Trusting
+// one proxy hop makes req.ip the real client IP from X-Forwarded-For, so the
+// limits apply per client as intended. `1` (not `true`) so client-supplied
+// X-Forwarded-For values aren't trusted and can't be spoofed to evade limits.
+// Override with TRUST_PROXY if the hop count ever changes.
+app.set('trust proxy', process.env.TRUST_PROXY || 1);
+
 // Cookies require credentialed CORS, which forbids the `*` origin — so we must
 // echo a specific allowed origin. By default we reflect the request's Origin
 // (fine when the API is only reachable by our own frontends); set CORS_ORIGINS
