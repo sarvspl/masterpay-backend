@@ -24,8 +24,8 @@ const n = (v, d) => {
 };
 
 module.exports = {
-  latestVersionCode: n(process.env.APP_LATEST_VERSION_CODE, 6),
-  latestVersionName: process.env.APP_LATEST_VERSION_NAME || '0.3.3',
+  latestVersionCode: n(process.env.APP_LATEST_VERSION_CODE, 7),
+  latestVersionName: process.env.APP_LATEST_VERSION_NAME || '0.3.4',
 
   // 0.1.x/0.2.x (codes 1–2) shipped the fail-open SMS sender check. Anyone on
   // those must update — but note only builds that CONTAIN the update check
