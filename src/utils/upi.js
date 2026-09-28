@@ -62,6 +62,8 @@ const BANK_SENDERS = {
   boi:        { name: 'Bank of India',         hints: ['BOIIND', 'BOISMS'] },
   rbl:        { name: 'RBL Bank',              hints: ['RBLBNK'] },
   au:         { name: 'AU Small Finance Bank', hints: ['AUBANK', 'AUSFBL'] },
+  // Seen live as 'BG-BDNSMS-S'.
+  bandhan:    { name: 'Bandhan Bank',          hints: ['BDNSMS'] },
 };
 
 /**
@@ -184,6 +186,26 @@ function senderHintsForBank(bankCode) {
 }
 
 /**
+ * The 6-char DLT header of an Indian sender ID ('SBIUPI', 'JD-SBIUPI-S',
+ * 'AX-SBIUPI'), or null for anything else — notably a personal mobile number.
+ * Same shapes as parseIndianSenderHeader() in the device matcher.
+ */
+function dltHeader(address) {
+  const m = String(address || '').trim().toUpperCase()
+    .match(/^(?:[A-Z]{2}-([A-Z0-9]{6})(?:-[A-Z])?|([A-Z0-9]{6}))$/);
+  return m ? (m[1] || m[2]) : null;
+}
+
+/**
+ * True when an SMS sender is one of this bank's registered headers. An unknown
+ * bank has no list and never passes — server-side settlement fails closed.
+ */
+function isBankSender(address, bankCode) {
+  const header = dltHeader(address);
+  return !!header && senderHintsForBank(bankCode).includes(header);
+}
+
+/**
  * Extract a VPA from a scanned/pasted UPI QR payload.
  * Accepts a full `upi://pay?pa=x@y&...` URI or a bare VPA. Returns null if
  * neither. Used to normalise whatever a vendor pastes or uploads into one
@@ -267,6 +289,8 @@ module.exports = {
   normalizeVpa,
   listBanks,
   senderHintsForBank,
+  dltHeader,
+  isBankSender,
   extractVpa,
   buildUpiUri,
   buildAppUri,

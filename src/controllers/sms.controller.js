@@ -127,7 +127,11 @@ function smsMatchesTransaction(smsBody, tx) {
   //    not as a substring of another word. e.g. "BKX92H1" should not match "BKX92H1A".
   const txnid = String(tx.txnid_submitted || '').toLowerCase();
   if (!txnid) return false;
-  const txnRe = new RegExp(`(?<![a-z0-9])${escapeRegex(txnid)}(?![a-z0-9])`, 'i');
+  //    An all-digit TxnID (a UPI UTR) only needs digit boundaries: banks glue a
+  //    letter onto it ("UPI/CR/C626690751269" — Bandhan), and the customer
+  //    types just the 12 digits their UPI app shows.
+  const boundary = /^\d+$/.test(txnid) ? '0-9' : 'a-z0-9';
+  const txnRe = new RegExp(`(?<![${boundary}])${escapeRegex(txnid)}(?![${boundary}])`, 'i');
   if (!txnRe.test(body.toLowerCase())) return false;
 
   // 2. Amount: compare the SMS's parsed "credited" amount to the transaction

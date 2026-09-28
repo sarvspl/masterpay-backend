@@ -4,7 +4,7 @@ const { notifyVerifyRequest } = require('../utils/push');
 const smsCtrl = require('./sms.controller');
 const { creditWalletIfTopup, debitVerifyFee } = require('../services/wallet');
 const { availabilityForVendorId, acceptsAmount } = require('../services/availability');
-const { isUpiProvider, buildUpiUri, buildAppUri, railCurrency } = require('../utils/upi');
+const { isUpiProvider, isBankSender, buildUpiUri, buildAppUri, railCurrency } = require('../utils/upi');
 
 /**
  * Total amount the customer pays = bill + gateway charge − gateway discount.
@@ -407,11 +407,10 @@ async function submitTxn(req, res, next) {
 
     const gateway_id = String(req.body.gateway_id || '').trim();
     if (!gateway_id) return res.status(400).json({ error: 'gateway_id is required' });
-    // What identifies the payment depends on the rail, and the rail isn't known
-    // until the gateway is loaded below — so the TxnID / payer-name check
-    // happens after that lookup rather than here.
-    const txnidRaw     = String(req.body.txnid || '').trim();
-    const payerNameRaw = String(req.body.payer_name || '').trim();
+    // The TxnID (wallet TrxID, or the UPI UTR) is the only thing the customer
+    // gives us; it is validated after the gateway lookup so the error can name
+    // the rail.
+    const txnidRaw = String(req.body.txnid || '').trim();
 
     // Payment proof: a screenshot of the confirmation is required. The customer
     // no longer enters the number they paid from — the Transaction ID + the
@@ -428,57 +427,28 @@ async function submitTxn(req, res, next) {
 
     // Validate gateway belongs to this merchant
     const g = await pool.query(
-      `SELECT id, provider, variant, account_number, label, account_id, min_amount, max_amount
+      `SELECT id, provider, variant, account_number, bank_code, label, account_id, min_amount, max_amount
          FROM gateways WHERE id = $1 AND merchant_id = $2 AND is_enabled = TRUE`,
       [gateway_id, s.merchant_id]
     );
     if (g.rowCount === 0) return res.status(400).json({ error: 'Invalid gateway for this merchant' });
     const gateway = g.rows[0];
 
-    // What identifies the payment, by rail.
-    //
-    // Wallet rails put a TrxID in their own confirmation SMS, so the customer
-    // reads it straight off the message and it is required.
-    //
-    // UPI requires BOTH, because the vendor's phone receives two independent
-    // signals and either one settles the payment:
-    //
-    //   - the bank's SMS, which quotes the 12-digit UTR
-    //   - the GPay/PhonePe notification, which names the payer
-    //
-    // Requiring both at INPUT is not the same as requiring both to MATCH:
-    // whichever arrives first and matches approves the payment, with no wait for
-    // the other. Collecting both simply means neither signal can be the one we
-    // happen to be missing.
+    // What identifies the payment: the TxnID, on every rail. Wallets quote their
+    // own TrxID in their SMS; for UPI it is the 12-digit UTR, which the payer's
+    // UPI app shows and the vendor's bank SMS quotes. Settlement is by SMS match
+    // only — no payer name, no app notification.
     const upi = isUpiProvider(gateway.provider);
-    const txnid = txnidRaw || null;
-    const payer_name_claimed = upi ? payerNameRaw : null;
+    // UTRs are often copied with spaces ("6266 9075 1269").
+    const txnid = upi ? txnidRaw.replace(/\s+/g, '') : txnidRaw;
 
     if (upi) {
-      if (!payer_name_claimed) {
-        return res.status(400).json({ error: 'Please enter the name your UPI account is registered in.' });
-      }
-      if (!txnid) {
-        return res.status(400).json({ error: 'Please enter the UPI reference number (UTR) from your payment.' });
-      }
-      // The whole name must match what the app reports, so a single initial or
-      // stray word can never settle a payment. Rejecting it here gives the
-      // customer an immediate, fixable error instead of a payment that sits
-      // pending until someone approves it by hand.
-      if (payer_name_claimed.replace(/[^\p{L}\p{N}]/gu, '').length < 3) {
-        return res.status(400).json({ error: 'Please enter your full name as it appears in your UPI app.' });
-      }
-      if (payer_name_claimed.length > 120) {
-        return res.status(400).json({ error: 'That name is too long — enter it as it appears in your UPI app.' });
+      if (!/^\d{12}$/.test(txnid)) {
+        return res.status(400).json({ error: 'Please enter the 12-digit UPI reference number (UTR) from your payment.' });
       }
     } else if (!txnid) {
       return res.status(400).json({ error: 'Transaction ID is required' });
     }
-
-    // The TxnID-keyed paths below (idempotency, inbound claim, late SMS match)
-    // are meaningful only when there IS one. A UPI payment submitted without a
-    // UTR skips them and is settled by the device instead.
-    const hasTxnid = !!txnid;
 
     // listCheckoutGateways already hides gateways whose min/max excludes this
     // order. Re-check here so a hand-crafted gateway_id can't slip past it.
@@ -521,25 +491,18 @@ async function submitTxn(req, res, next) {
     //   rejected so the customer can't fork the session across multiple
     //   pending rows. Idempotent retry of the same TxnID is handled below.
     const sessionTx = await pool.query(
-      `SELECT id, txnid_submitted, payer_name_claimed, status FROM transactions
+      `SELECT id, txnid_submitted, status FROM transactions
         WHERE session_id = $1
         ORDER BY created_at DESC LIMIT 1`,
       [s.id]
     );
     if (sessionTx.rowCount > 0) {
       const t = sessionTx.rows[0];
-      // A UPI row has no TxnID, so "same submission" means the same payer name.
-      // A UPI row is identified by its payer name, which is always present; the
-      // UTR is optional there so it can't be the test.
-      const sameSubmission = upi
-        ? !!t.payer_name_claimed &&
-          t.payer_name_claimed.trim().toLowerCase() === payer_name_claimed.trim().toLowerCase()
-        : !!t.txnid_submitted && !!txnid && t.txnid_submitted.toLowerCase() === txnid.toLowerCase();
+      const sameSubmission =
+        !!t.txnid_submitted && t.txnid_submitted.toLowerCase() === txnid.toLowerCase();
       if (!sameSubmission) {
         return res.status(409).json({
-          error: upi
-            ? 'This checkout already has a submitted payment. You can\'t change the payment method.'
-            : 'This checkout already has a submitted Transaction ID. You can\'t change the payment method.',
+          error: 'This checkout already has a submitted Transaction ID. You can\'t change the payment method.',
           existing_status: t.status,
         });
       }
@@ -550,17 +513,9 @@ async function submitTxn(req, res, next) {
     //   A TxnID is supposed to be globally unique (it's a wallet transaction id),
     //   so seeing one twice is either a retry / accidental double-submit, or an
     //   attempt to reuse one payment for two orders. Either way we never want a
-    //   second row — return whatever state the first one is in.
-    //
-    //   Skipped for UPI, which has no TxnID to be idempotent on. A payer name is
-    //   not a payment identifier — two different customers can share one, and
-    //   the same customer legitimately places more than one order. Replay is
-    //   instead prevented at settlement: uniq_tx_merchant_fingerprint_success
-    //   (043) lets a given notification settle exactly one transaction, so a
-    //   second order claiming the same payment stays pending for manual review.
-    const existing = !hasTxnid
-      ? { rowCount: 0, rows: [] }
-      : await pool.query(
+    //   second row — return whatever state the first one is in. A UPI UTR is
+    //   just as unique, so the same rule covers UPI.
+    const existing = await pool.query(
           `SELECT id, session_id, status, amount, created_at, failure_reason
              FROM transactions
             WHERE merchant_id = $1 AND LOWER(txnid_submitted) = LOWER($2)
@@ -610,9 +565,9 @@ async function submitTxn(req, res, next) {
     //   tryCreateInbound() may have already created a success row with
     //   matched_sms set and session_id NULL. If its TxnID matches what the
     //   customer just typed, link it to this session.
-    //   Skipped for UPI: inbound rows are created by TxnID from an SMS, and a
-    //   UPI payment has neither.
-    const inbound = !hasTxnid
+    //   Skipped for UPI: inbound rows are created without checking the SMS
+    //   sender against the gateway's bank, so they can't settle a UPI payment.
+    const inbound = upi
       ? { rowCount: 0, rows: [] }
       : await pool.query(
           `SELECT id, amount FROM transactions
@@ -654,13 +609,10 @@ async function submitTxn(req, res, next) {
     //
     //   The SMS might be in sms_messages but unmatched (e.g. amount parser
     //   missed it). Walk the last 15 minutes and try a strict match.
-    //   Skipped for UPI: this searches SMS bodies for the TxnID, and a UPI
-    //   payment has none. Its equivalent lives on the device, which matches the
-    //   payer name against the UPI app's own notification.
-    const smsRows = !hasTxnid
-      ? { rows: [] }
-      : await pool.query(
-          `SELECT id, body FROM sms_messages
+    //   For UPI the SMS must also come from the gateway's own bank (DLT header
+    //   in BANK_SENDERS), the same anti-forgery rule the device applies.
+    const smsRows = await pool.query(
+          `SELECT id, sender, body FROM sms_messages
             WHERE merchant_id = $1
               AND received_at > NOW() - INTERVAL '15 minutes'
               AND LOWER(body) LIKE LOWER('%' || $2 || '%')
@@ -671,6 +623,7 @@ async function submitTxn(req, res, next) {
     for (const sms of smsRows.rows) {
       // Reject debit SMS
       if (smsCtrl.extractDirection(sms.body) === 'debit') continue;
+      if (upi && !isBankSender(sms.sender, gateway.bank_code)) continue;
       // Must reference THIS gateway's account
       const matchedGw = smsCtrl.findGatewayInSms(sms.body, [gateway]);
       if (!matchedGw) continue;
@@ -717,12 +670,11 @@ async function submitTxn(req, res, next) {
       `INSERT INTO transactions
          (session_id, merchant_id, brand_id, gateway_id, txnid_submitted, amount, customer_phone,
           sender_account, proof_image_url, activation_account_id, vendor_topup_account_id, vendor_topup_credit_amount,
-          charged_currency, payer_name_claimed)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          charged_currency)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING id, status, created_at`,
       [s.id, s.merchant_id, s.brand_id, gateway.id, txnid, totalD, s.customer_phone,
-       sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit, chargedCurrency,
-       payer_name_claimed]
+       sender_account, proof_image_url, vActivationAcct, vTopupAcct, vTopupCredit, chargedCurrency]
     );
 
     // Fire-and-forget — never block the customer's response on push delivery.

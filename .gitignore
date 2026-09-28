@@ -3,3 +3,6 @@ node_modules/
 *.log
 .DS_Store
 dist/
+
+# Claude Code project map (local only)
+CLAUDE.md
