@@ -405,7 +405,11 @@ async function poll(req, res, next) {
         WHERE t.merchant_id = $1
           AND g.account_id = $2
           AND t.status = 'pending'
-        ORDER BY t.created_at ASC
+        -- NEWEST first. The phone can only match SMS from the last 30 minutes,
+        -- so the fresh payments are the ones it can actually verify. Oldest-first
+        -- let 20 stale pendings fill the LIMIT and starve every new payment: they
+        -- were never sent to the phone at all.
+        ORDER BY t.created_at DESC
         LIMIT 20`,
       [merchant_id, account_id]
     );
