@@ -168,7 +168,7 @@ async function getMerchant(req, res, next) {
     // Vendors = this merchant's non-Primary accounts, with headline status so
     // the admin can review the marketplace's sellers.
     const vendorsRes = await pool.query(
-      `SELECT a.id, a.label, a.username, a.external_id, a.activated_at, a.wallet_balance, a.created_at,
+      `SELECT a.id, a.label, a.username, a.external_id, a.activated_at, a.suspended_at, a.wallet_balance, a.created_at,
               (SELECT COUNT(*)::int FROM gateways g WHERE g.account_id = a.id AND g.is_enabled = TRUE)                                   AS gateway_count,
               (SELECT COUNT(*)::int FROM devices dv WHERE dv.account_id = a.id AND dv.unbound_at IS NULL)                                AS device_count,
               (SELECT COUNT(*)::int      FROM transactions t JOIN gateways g2 ON g2.id = t.gateway_id WHERE g2.account_id = a.id AND t.status = 'success') AS txn_count,
@@ -195,6 +195,8 @@ async function getMerchant(req, res, next) {
       has_login: v.username != null,
       is_activated: v.username != null && (v.activated_at != null || activationFee <= 0),
       activated_at: v.activated_at,
+      is_suspended: v.suspended_at != null,
+      suspended_at: v.suspended_at,
       wallet_balance: Number(v.wallet_balance || 0),
       gateway_count: v.gateway_count,
       device_count: v.device_count,
