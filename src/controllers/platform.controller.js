@@ -93,7 +93,9 @@ async function listRecharges(req, res, next) {
              g.provider, g.variant, g.account_number, g.label AS gateway_label
         FROM payment_sessions s
         LEFT JOIN merchants rm ON rm.id::text = (s.metadata->>'recharge_for_merchant_id')
-        LEFT JOIN LATERAL (
+        -- Inner join: abandoned checkouts (no Transaction ID submitted) are not
+        -- recharge requests and must not list as "Pending".
+        JOIN LATERAL (
           SELECT id, txnid_submitted, status, result_source, verified_at, failure_reason, gateway_id, proof_image_url
             FROM transactions
            WHERE session_id = s.id

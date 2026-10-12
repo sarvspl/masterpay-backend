@@ -63,7 +63,10 @@ async function listRecharges(req, res, next) {
               t.result_source, t.verified_at, t.failure_reason,
               g.provider, g.variant, g.account_number, g.label AS gateway_label
          FROM payment_sessions s
-         LEFT JOIN LATERAL (
+         -- Inner join: only checkouts where a Transaction ID was submitted. A
+         -- session the payer opened and abandoned is not a recharge request and
+         -- used to show up here as a phantom "Pending".
+         JOIN LATERAL (
            SELECT id, txnid_submitted, status, result_source, verified_at, failure_reason, gateway_id
              FROM transactions
             WHERE session_id = s.id

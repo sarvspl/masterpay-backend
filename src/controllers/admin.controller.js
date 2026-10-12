@@ -512,7 +512,8 @@ async function getMerchantRecharges(req, res, next) {
       `SELECT COUNT(*)::int AS n
          FROM payment_sessions s
         WHERE s.metadata->>'type' = 'wallet_topup'
-          AND s.metadata->>'recharge_for_merchant_id' = $1::text`,
+          AND s.metadata->>'recharge_for_merchant_id' = $1::text
+          AND EXISTS (SELECT 1 FROM transactions t WHERE t.session_id = s.id)`,
       [req.params.id]
     );
     const r = await pool.query(
@@ -522,7 +523,9 @@ async function getMerchantRecharges(req, res, next) {
               t.result_source, t.verified_at, t.failure_reason,
               g.provider, g.variant, g.account_number, g.label AS gateway_label
          FROM payment_sessions s
-         LEFT JOIN LATERAL (
+         -- Inner join: abandoned checkouts (no Transaction ID submitted) are not
+         -- recharge requests and must not list as "Pending".
+         JOIN LATERAL (
            SELECT id, txnid_submitted, status, result_source, verified_at, failure_reason, gateway_id
              FROM transactions
             WHERE session_id = s.id
