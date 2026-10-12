@@ -164,10 +164,16 @@ async function getSessionForMerchant(req, res, next) {
     const r = await pool.query(
       `SELECT s.*,
               (SELECT row_to_json(t) FROM (
-                 SELECT id, txnid_submitted, status, verified_at, result_source
-                 FROM transactions
-                 WHERE session_id = s.id AND status = 'success'
-                 ORDER BY verified_at DESC NULLS LAST LIMIT 1
+                 SELECT tx.id, tx.txnid_submitted, tx.status, tx.verified_at, tx.result_source,
+                        tx.amount,
+                        g.provider       AS method,
+                        g.variant,
+                        g.account_number AS paid_to,
+                        tx.sender_account
+                 FROM transactions tx
+                 LEFT JOIN gateways g ON g.id = tx.gateway_id
+                 WHERE tx.session_id = s.id AND tx.status = 'success'
+                 ORDER BY tx.verified_at DESC NULLS LAST LIMIT 1
               ) t) AS successful_transaction,
               -- Latest transaction of ANY status, with the details a merchant
               -- server needs to verify a payment: UTR, payment method, and the
@@ -178,6 +184,7 @@ async function getSessionForMerchant(req, res, next) {
                         g.provider AS method,
                         g.variant,
                         g.account_number,
+                        g.account_number AS paid_to,
                         t.sender_account,
                         t.amount,
                         t.status,
@@ -748,10 +755,15 @@ async function checkoutStatus(req, res, next) {
 
 async function loadLatestTxForSession(sessionId) {
   const tx = await pool.query(
-    `SELECT id, txnid_submitted, amount, status, failure_reason, verified_at, result_source, gateway_id
-       FROM transactions
-      WHERE session_id = $1
-      ORDER BY created_at DESC LIMIT 1`,
+    `SELECT t.id, t.txnid_submitted, t.amount, t.status, t.failure_reason, t.verified_at, t.result_source, t.gateway_id,
+            -- Which number the customer paid. The customer already saw it on
+            -- the pay screen, so it is safe on this public endpoint; the result
+            -- page passes it back to the merchant's redirect_url.
+            g.provider AS method, g.account_number AS paid_to
+       FROM transactions t
+       LEFT JOIN gateways g ON g.id = t.gateway_id
+      WHERE t.session_id = $1
+      ORDER BY t.created_at DESC LIMIT 1`,
     [sessionId]
   );
   return tx.rows[0] || null;
